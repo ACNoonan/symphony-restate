@@ -1,0 +1,29 @@
+symphony-restate
+Copyright 2026 Adam Noonan
+
+This product is licensed under the Apache License, Version 2.0 (the "License");
+you may not use this product except in compliance with the License. You may
+obtain a copy of the License in the LICENSE file or at:
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+----------------------------------------------------------------------
+
+This product includes code derived from OpenAI Symphony
+(https://github.com/openai/symphony), Copyright 2025 OpenAI, used under
+the Apache License, Version 2.0. The following modules contain substantial
+ports or adaptations:
+
+  * apps/symphony_runtime/lib/symphony/runtime/codex/app_server.ex
+      Derived from `SymphonyElixir.Codex.AppServer` (symphony/elixir/lib/
+      symphony_elixir/codex/app_server.ex). Reduced surface area: no SSH
+      transport, no dynamic-tool registration, single-shot turn lifecycle.
+
+  * apps/symphony_core/lib/symphony/core/workflow.ex
+      Parsing logic adapted from `SymphonyElixir.Workflow`. External
+      contract (front-matter + Markdown body, error classes) preserved
+      per SPEC.md §5.
+
+WORKFLOW.md format and the Linear / Codex app-server protocols themselves
+are part of the OpenAI Symphony specification at
+https://github.com/openai/symphony/blob/main/SPEC.md.

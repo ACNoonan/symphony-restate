@@ -29,6 +29,7 @@ defmodule Symphony.Runtime.IssueVO do
   alias Restate.Context
   alias Symphony.Core.{Prompt, Workflow}
   alias Symphony.Runtime.Linear
+  alias Symphony.Runtime.Codex.{AppServer, Workspace}
 
   @doc "Restate handler. Input is ignored; state lives in the VO."
   def dispatch(%Context{} = ctx, _input) do
@@ -50,6 +51,7 @@ defmodule Symphony.Runtime.IssueVO do
 
   defp run_attempt(ctx, identifier) do
     workflow_path = Application.fetch_env!(:symphony_runtime, :workflow_path)
+    workspace_root = Application.fetch_env!(:symphony_runtime, :workspace_root)
 
     {workflow_config, prompt_template} =
       Context.run(ctx, fn ->
@@ -69,6 +71,11 @@ defmodule Symphony.Runtime.IssueVO do
         Linear.fetch_issue!(identifier)
       end)
 
+    workspace =
+      Context.run(ctx, fn ->
+        Workspace.ensure!(issue, workspace_root)
+      end)
+
     rendered_prompt =
       Context.run(ctx, fn ->
         case Prompt.render(prompt_template, %{issue: issue, attempt: nil}) do
@@ -84,7 +91,7 @@ defmodule Symphony.Runtime.IssueVO do
 
     turn_output =
       Context.run(ctx, fn ->
-        stub_codex_turn(rendered_prompt, workflow_config)
+        codex_turn!(workspace, rendered_prompt, issue, workflow_config)
       end)
 
     comment_id =
@@ -105,23 +112,42 @@ defmodule Symphony.Runtime.IssueVO do
     }
   end
 
-  # Slice 1.0 stub. Replaced in slice 1.5 with a real codex
-  # `app-server` stdio session owned by an OTP-supervised
-  # `Codex.Session` GenServer (see docs/architecture.md). The stub
-  # is deterministic so replays through `ctx.run` are stable.
-  defp stub_codex_turn(prompt, _config) do
-    """
-    [symphony-restate slice-1 stub]
-    Real codex `app-server` integration lands in slice 1.5. For now,
-    this is what the agent would have received as its initial turn.
+  defp codex_turn!(workspace, prompt, issue, workflow_config) do
+    opts = codex_opts_from_config(workflow_config)
+    issue_meta = %{identifier: issue.identifier, title: issue.title || ""}
 
-    --- prompt ---
-    #{prompt}
-    --- end prompt ---
+    case AppServer.run(workspace, prompt, issue_meta, opts) do
+      {:ok, %{text: text}} when text != "" ->
+        text
 
-    Stub response: acknowledged. (Replace with real codex turn output
-    once the stdio session is wired up.)
-    """
-    |> String.trim()
+      {:ok, %{text: ""}} ->
+        # Codex completed without emitting any text we recognized.
+        # Surface a useful message rather than posting an empty comment.
+        "[symphony-restate] codex turn completed without an extractable agent message; check Restate journal for raw events."
+
+      {:error, reason} ->
+        raise Restate.TerminalError,
+          code: 500,
+          message: "codex_turn_failed: #{inspect(reason)}"
+    end
+  end
+
+  defp codex_opts_from_config(%{"codex" => codex}) when is_map(codex) do
+    []
+    |> maybe_put(codex, "command", :codex_command)
+    |> maybe_put(codex, "approval_policy", :approval_policy)
+    |> maybe_put(codex, "thread_sandbox", :thread_sandbox)
+    |> maybe_put(codex, "turn_sandbox_policy", :turn_sandbox_policy)
+    |> maybe_put(codex, "turn_timeout_ms", :turn_timeout_ms)
+    |> maybe_put(codex, "read_timeout_ms", :read_timeout_ms)
+  end
+
+  defp codex_opts_from_config(_), do: []
+
+  defp maybe_put(opts, source, source_key, dest_key) do
+    case Map.get(source, source_key) do
+      nil -> opts
+      value -> Keyword.put(opts, dest_key, value)
+    end
   end
 end

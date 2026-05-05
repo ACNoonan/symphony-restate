@@ -2,7 +2,7 @@
 
 OpenAI [Symphony](https://github.com/openai/symphony) on Restate — a durable substrate for the spec.
 
-> **Status: pre-alpha, slice 1 done (2026-05-05).** Pivoted 2026-05-05. Built on
+> **Status: pre-alpha, slice 1.5 done (2026-05-05).** Pivoted 2026-05-05. Built on
 > [`restate-elixir`](https://github.com/ACNoonan/restate-elixir) v0.2.0 (local path-dep
 > until Hex-published). Implements Symphony's `SPEC.md` external contract; internal
 > architecture is Restate-native. See `docs/architecture.md`.
@@ -87,7 +87,7 @@ the BEAM mid-flow and Restate replays past completed `ctx.run` blocks on resume.
 |---|---|---|
 | 0 | Umbrella scaffold, Apache-2.0, deps wired | **done** |
 | 1 | WORKFLOW.md parser + Liquid render in `:symphony_core`; `IssueVO.dispatch` w/ Linear fetch + post-comment + stub codex turn; `mix symphony.dispatch` task; endpoint registered on :9082 | **done (2026-05-05)** |
-| 1.5 | Replace stub turn with real `codex app-server` stdio session (port from upstream `SymphonyElixir.Codex.AppServer`) | not started |
+| 1.5 | Real `codex app-server` stdio session (single-shot port of upstream `SymphonyElixir.Codex.AppServer`); per-turn workspace ensure; auto-approval policy for non-interactive runs | **done (2026-05-05)** |
 | 2 | `max_turns` continuation loop; OTP-supervised `Codex.Session`; conversation replay on respawn; extract `RunAttemptWorkflow` | not started |
 | 3 | Scheduler / poll loop; reconciliation; stall detection | not started |
 | 4 | Phoenix LiveView dashboard reading Restate journal | not started |
@@ -97,4 +97,6 @@ Demo readiness gate: see [`demo-engineering.md` §6](../demo-engineering.md).
 
 ## License
 
-Apache-2.0 (matching upstream Symphony).
+Apache-2.0 (matching upstream Symphony). Portions of this code are derived from
+[OpenAI Symphony](https://github.com/openai/symphony); see [`NOTICE`](NOTICE) for
+the per-module attribution.
