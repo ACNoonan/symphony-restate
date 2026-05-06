@@ -12,15 +12,15 @@ co-stars.
 | §4.1.8 Orchestrator Runtime State | Distributed across VO state + Workflow journals. Never serialized as one object. |
 | §7.1 Issue States (`Unclaimed`/`Claimed`/`Running`/`RetryQueued`) | VO state machine. Single-writer guarantee makes "claimed" trivially correct. |
 | §7.2 Run Attempt (11 phases) | `RunAttemptWorkflow` invocation. Each durable boundary = a journal entry. The 11 phases fall out of implementation, not enum bookkeeping. |
-| §8.1 Poll Loop | `Scheduler` VO self-schedules with `ctx.send(..., invoke_at_ms:)` / `ctx.sleep`. Suspends to ~$0 between ticks. |
+| §8.1 Poll Loop | `SchedulerVO` (per-project key) self-schedules its `tick` handler via `ctx.send_async(self, "tick", nil, invoke_at_ms: now + interval_ms)`. Suspends to ~$0 between ticks. |
 | §8.4 Retry/Backoff | Workflow-level retry policy + durable timers. Cancellable because the run attempt is its own invocation, not a hidden local loop. |
-| §8.5 Stall Detection | `Awaitable.any([turn_complete, stall_timer])` where `turn_complete` is a durable completion handle, not a blocking local port read. |
+| §8.5 Stall Detection | `Awaitable.any([turn_handle, ctx.timer(stall_timeout_ms)])` in `RunAttemptWorkflow`, where `turn_handle` is a `Context.call_async` to `CodexTurnService`. On stall, the `Codex.Session` port is killed so the abandoned turn releases resources. |
 | §6.2 Dynamic `WORKFLOW.md` reload | **Replaced.** Workflow definition is a deployment artifact. Each attempt pins `workflow_version` / content hash; redeploy affects new attempts only. |
 | §5 `WORKFLOW.md` format | **Kept as-is.** External contract. |
 | §5.4 Liquid template rendering | Pure function in `:symphony_core`. Called from inside `ctx.run`. |
 | Linear adapter | Same external behavior. Reads are journaled. Writes use deterministic markers / idempotency checks so retry cannot duplicate comments. |
 | Codex stdio app-server | OTP-supervised port. The process is not durable; turn requests, completions, transcript refs, and cancellation state are. |
-| Phoenix LiveView dashboard | Reads Restate admin API + journal queries instead of GenServer state. |
+| Phoenix LiveView dashboard | `Symphony.Dashboard.OverviewLive` reads our own observability handlers (`SchedulerVO.reconcile`, `IssueVO.readState`, `RunAttemptWorkflow.readState`) over Restate ingress — same path any other Restate client would use. No GenServer state, no journal reads (yet). |
 
 ## Co-star design
 
@@ -88,14 +88,20 @@ enough workspace metadata to restart on another node. If a BEAM node dies, the
 new node may lose the warm thread, but it must not lose the right to continue
 the attempt or duplicate externally visible writes.
 
-Slice 2 deliberately cheats this boundary for speed: `IssueVO` still calls
-`Codex.Manager.run_turn/6` inside `ctx.run`. That is acceptable for proving the
-port/session handoff, but it is not the final stall/cancellation shape. Before
-slice 3, Codex turn execution should be modeled as an awaitable/cancellable
-operation so `Awaitable.any([turn_complete, stall_timer])` is a real durable
-race rather than a comment around a blocking local call.
+Slice 2 deliberately cheated this boundary for speed: `IssueVO` called
+`Codex.Manager.run_turn/6` inside `ctx.run` — a blocking local call with no
+awaitable handle. **Slice 3 closes the cheat**: the codex turn is its own
+Restate Service (`CodexTurnService`); `RunAttemptWorkflow` issues it via
+`ctx.call_async` and races the resulting handle against `ctx.timer(stall_timeout_ms)`
+through `Awaitable.any/2`. On stall, the workflow kills the local
+`Codex.Session` port (so the abandoned in-flight turn releases its file
+descriptors) and raises a terminal `codex_turn_stall` failure for the attempt.
+Cancellation across the call tree is best-effort — Restate's CANCEL signal raises
+at the *next suspending op*, so a turn already inside `ctx.run` runs to its
+own completion before the cancel surfaces; the port-kill is the OTP-side
+preemption that meets the cancel halfway.
 
-### Failure beats (slice 2 implementation status)
+### Failure beats (slice 3 implementation status)
 
 1. **Codex port dies (`pkill -9 codex`).** `Codex.Session.handle_info/2` catches
    `{port, {:exit_status, _}}` and stops the GenServer. The DynamicSupervisor
@@ -103,22 +109,32 @@ race rather than a comment around a blocking local call.
    Manager sees no Registry entry, spawns a fresh Session, and the cold-path
    seeding (preamble built from durable `conversation` state) rehydrates codex.
    Implemented in slice 2.
-2. **BEAM Node A dies.** `Codex.Session` and the Restate handler invocation
-   die with the BEAM. Restate's runtime detects the timeout and retries the
-   invocation; routing picks Node B. The IssueVO replay returns journaled
-   values for completed `ctx.run` blocks, then the next turn's `ctx.run`
-   re-executes — `Manager.run_turn/6` on Node B has no Session for this
-   issue, spawns one, the cold-path preamble rebuilds context. Co-star
-   handoff. Implemented in slice 2.
-
-   Final architecture note: re-executing a Codex turn is not always harmless.
-   Slice 2 relies on demo-scale behavior; slice 2.5 moves the attempt into a
-   Workflow and slice 3 makes the turn completion awaitable so Restate can
-   cancel or stall the turn at a durable boundary.
+2. **BEAM Node A dies.** `Codex.Session` and the in-flight `CodexTurnService`
+   invocation on Node A die with the BEAM. Restate's runtime detects the
+   timeout and retries the invocation; routing picks Node B. `RunAttemptWorkflow`
+   is unaffected (its `call_async` handle is durable; the result still arrives
+   when the retry on Node B completes). On Node B `Manager.run_turn/6` has no
+   Session for this issue, spawns one, cold-path preamble rebuilds context.
+   Implemented in slices 2 + 3.
 3. **Restate cluster node dies mid-handler-call.** Restate cluster re-routes
-   the invocation; VO state untouched; the call retries durably. The OTP side
-   never notices because the durable state didn't move. Implemented at the
-   Restate-Elixir SDK layer; symphony-restate inherits it for free.
+   the invocation; VO/Workflow state untouched; the call retries durably. The
+   OTP side never notices because the durable state didn't move. Implemented
+   at the Restate-Elixir SDK layer; symphony-restate inherits it for free.
+4. **Codex turn stalls (no progress for `codex.stall_timeout_ms`).** Slice 3
+   `RunAttemptWorkflow.run_turn_with_stall_detection/8` races the
+   `CodexTurnService` invocation against a `ctx.timer`. Stall wins → kill the
+   local `Codex.Session` port (the in-flight `Manager.run_turn` returns a
+   port-exit error, the `CodexTurnService` invocation completes with terminal
+   failure, and its result is abandoned because the workflow already took the
+   stall branch); raise `Restate.TerminalError{message: "codex_turn_stall: ..."}`
+   for the attempt; `IssueVO` records `claim_status="failed"` and surfaces the
+   error to whoever invoked it (operator, scheduler).
+5. **Issue goes to a tracker terminal state mid-attempt.** Existing slice 2
+   behavior preserved: `RunAttemptWorkflow` re-fetches the issue between turns
+   and breaks the loop early if `state` is in `terminal_states`. Slice 3 does
+   not yet preempt mid-turn; that requires `Context.cancel_invocation` on the
+   live `CodexTurnService` invocation id, which `call_async` does not directly
+   expose — flagged for slice 4/5 if the demo needs it.
 
 ## Slice-by-slice architecture growth
 
@@ -129,8 +145,8 @@ race rather than a comment around a blocking local call.
 | 1.5 | `Symphony.Runtime.Codex.AppServer` — minimal port of upstream's stdio JSON-RPC client (single-shot `run/4`); auto-approval policy; `Codex.Workspace.ensure!/2`. | done |
 | 2 | `Codex.AppServer.start/2` + `turn/4` + `stop/1` (broken out so port stays warm); `Codex.Session` GenServer (long-lived port + thread, cold-path seeding); `Codex.Supervisor` DynamicSupervisor + `Codex.Registry`; `Codex.Manager` find-or-spawn API; `IssueVO` `1..max_turns` loop with durable `conversation` state; per-turn Linear comment; mid-loop tracker re-fetch + terminal-state break; `Codex.Manager.stop_session/1` on terminal. | done |
 | 2.5 | `IssueVO` slimmed to claim/dispatch (`claim_status`, `last_attempt_n`, `worker_node`); turn loop extracted into `RunAttemptWorkflow` (Workflow service keyed `${id}::a${n}`); WORKFLOW.md content read inside `ctx.run` so its bytes (and the SHA-256 hash) are pinned per attempt; `Workspace` split into `path_for/2` (journaled, inside `ctx.run`) + `preflight_local!/1` (outside, every replay) so cross-node resumes don't see a missing cwd; `Linear.post_comment_idempotent!/3` w/ deterministic `(identifier, attempt_n, turn_n)` marker; `Codex.Session` idle timeout w/ `Manager.run_turn` retry-on-noproc; `Codex.DynamicTool` registers `linear_graphql` on `thread/start` and dispatches `item/tool/call`. | done |
-| 3 | `Scheduler` VO (poll-tick); reconciliation across N issues (`Awaitable.all`); Codex turn awaitable/cancellable boundary; stall detection (`Awaitable.any`). | not started |
-| 4 | Phoenix LiveView dashboard; reads Restate admin API + journals. | not started |
+| 3 | `CodexTurnService` extracts the codex turn into a Restate Service so the workflow gets an awaitable handle; `RunAttemptWorkflow` races the turn against `ctx.timer(stall_timeout_ms)` via `Awaitable.any`, kills `Codex.Session` on stall, raises terminal `codex_turn_stall`; `IssueVO.read_state` shared handler for non-mutating snapshots; `Linear.list_issues_in_project!` + active-state filter; `SchedulerVO` per-project poll loop self-rescheduling its `tick` via `ctx.send_async(invoke_at_ms:)`, fanning out per-issue dispatches via `send_async`, and `reconcile` reading N issues' VO state in parallel with `call_async` + `Awaitable.all`; `mix symphony.scheduler {start,stop,tick,reconcile}` CLI. | done |
+| 4 | New `:symphony_dashboard` umbrella app: Phoenix 1.7 + LiveView 1.0 on `:4000`; `Symphony.Dashboard.OverviewLive` with 2s auto-refresh via `Process.send_after(:refresh)`; `Symphony.Dashboard.RestateClient` (Req-based HTTP wrapper for ingress) reads `SchedulerVO.reconcile` / `IssueVO.readState` / `RunAttemptWorkflow.readState`; click-to-expand row panels show per-attempt conversation, content-hash pin, workspace_path; `RunAttemptWorkflow.read_state` shared handler added; layout serves Phoenix + LV JS from each dep's `priv/static` (no asset pipeline). | done |
 | 5 | Chaos hooks (kill codex / kill BEAM node / kill Restate node); demo-script E2E. | not started |
 
 ## Resolved architectural items (slice 2)
@@ -150,8 +166,9 @@ race rather than a comment around a blocking local call.
 
 ## Architectural invariants
 
-- **No central orchestrator process.** Scheduling can be centralized as a
-  durable VO tick, but issue correctness always lives at the per-issue key.
+- **No central orchestrator process.** Scheduling is centralized as a
+  durable VO tick (`SchedulerVO`, one per project slug), but issue
+  correctness always lives at the per-issue key.
 - **No durable illusion around ports.** A `Codex.Session` may die at any time.
   Durable state must be sufficient to restart on a different BEAM node.
 - **No blocking local call where the design promises a durable race.** Stall
@@ -200,3 +217,42 @@ race rather than a comment around a blocking local call.
 - ~~**WORKFLOW.md hot-reload.**~~ Workflow content is read inside the
   `RunAttemptWorkflow`'s first `ctx.run`, so its bytes are pinned per
   attempt. Editing WORKFLOW.md affects new attempts only.
+
+## Resolved in slice 3
+
+- ~~**Codex turn awaitable boundary.**~~ `CodexTurnService` is a
+  Restate Service whose `run/2` handler wraps `Codex.Manager.run_turn/6`
+  in a single `ctx.run`. `RunAttemptWorkflow` calls it via
+  `Context.call_async/5`, getting a durable handle.
+- ~~**Stall detection.**~~ `Awaitable.any([turn_handle, ctx.timer(stall_timeout_ms)])`
+  in `RunAttemptWorkflow.run_turn_with_stall_detection/8`. Stall timeout
+  pulled from `codex.stall_timeout_ms` in WORKFLOW.md (default 5 min).
+- ~~**Per-project poll loop.**~~ `SchedulerVO.tick/2` self-reschedules
+  via `ctx.send_async(self, "tick", nil, invoke_at_ms: now + interval_ms)`.
+  Suspends to ~$0 between ticks (no process held). `running` flag in VO
+  state lets `stop` halt the chain on the next tick boundary.
+- ~~**Reconciliation across N issues.**~~ `SchedulerVO.reconcile/2` lists
+  the project's issues, fans out `IssueVO.read_state` calls via
+  `Context.call_async/5`, and gathers the snapshot via
+  `Restate.Awaitable.all/2` — wall time is one Restate round-trip,
+  not N.
+
+## Resolved in slice 4
+
+- ~~**Operator visibility.**~~ Phoenix LiveView dashboard at
+  `http://localhost:4000` (started by `mix run --no-halt` alongside
+  the Restate handler endpoint). One page, 2 s auto-refresh via
+  `Process.send_after(:refresh)`. Reads `SchedulerVO.reconcile`,
+  `IssueVO.readState`, `RunAttemptWorkflow.readState` over the
+  same Restate ingress that any other client uses — keeps the
+  "Restate is the source of truth" story honest.
+- ~~**Per-attempt conversation visibility.**~~
+  `RunAttemptWorkflow.read_state` shared handler exposes
+  `workflow_content_hash`, `workspace_path`, `conversation`,
+  `turn_count`, `last_comment_id`. The dashboard fetches it
+  lazily on row expand and re-fetches every refresh while the
+  row stays open.
+- ~~**Co-star visibility.**~~ The dashboard itself is the
+  Phoenix half of the BEAM/Restate co-star pitch — it reads
+  Restate-owned durable state through Restate's own protocol,
+  using OTP-supervised LiveView processes for the live UI.

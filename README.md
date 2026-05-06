@@ -2,7 +2,7 @@
 
 OpenAI [Symphony](https://github.com/openai/symphony) on Restate — a durable substrate for the spec.
 
-> **Status: pre-alpha, slice 2.5 done (2026-05-05).** Pivoted 2026-05-05. Built on
+> **Status: pre-alpha, slice 4 done (2026-05-06).** Pivoted 2026-05-05. Built on
 > [`restate-elixir`](https://github.com/ACNoonan/restate-elixir) v0.2.0 (local path-dep
 > until Hex-published). Implements Symphony's `SPEC.md` external contract; internal
 > architecture is Restate-native. See `docs/architecture.md`.
@@ -49,24 +49,33 @@ See `docs/architecture.md` for diagrams + the full mapping against `SPEC.md`.
 
 ## Restate primitives shown
 
-Shipped through slice 2.5:
+Shipped through slice 3:
 
 - **Virtual Object** state on `IssueVO` (per-issue `claim_status`, `last_attempt_n`,
   `last_attempt_result`; `worker_node` is persisted for observability only, never
   read for routing)
 - **Workflow** state on `RunAttemptWorkflow` (per-attempt `workflow_content_hash`,
   `workspace_path`, durable `conversation`, `turn_count`, `last_comment_id`)
+- **Virtual Object** state on `SchedulerVO` (per-project `running`, `interval_ms`,
+  `last_tick_at_ms`, `dispatched_total`)
 - `ctx.call` from `IssueVO` into `RunAttemptWorkflow` (durable cross-service call;
   retries journaled, terminal failures propagate)
+- `ctx.call_async` + `Awaitable.any` for the codex-turn-vs-stall race in
+  `RunAttemptWorkflow`
+- `ctx.call_async` + `Awaitable.all` for the per-issue VO-state fan-out in
+  `SchedulerVO.reconcile`
+- `ctx.send_async(invoke_at_ms:)` for `SchedulerVO`'s self-rescheduling tick
+  loop and for fire-and-forget per-issue dispatches
+- `ctx.timer` for the stall timer
 - `ctx.run` for journaled side effects (WORKFLOW.md load + content-hash pin,
-  Linear fetch / idempotent comment, codex turn I/O, prompt render)
-- `ctx.set_state` for the per-turn `conversation` append
+  Linear fetch / idempotent comment, prompt render, system-time capture,
+  port-kill on stall)
+- `ctx.set_state` for the per-turn `conversation` append + per-tick scheduler
+  bookkeeping
 
 Planned in later slices:
 
-- `ctx.sleep` + scheduled invocations (poll loop, retry backoff, stall detection) — slice 3
-- `Awaitable.any` / `all` (turn-vs-stall race, fan-out reconciliation) — slice 3
-- Cancellation (terminal-state issue → cancel running run) — slice 3
+- Chaos hooks + demo-script E2E (slice 5)
 
 ## Run it locally
 
@@ -86,8 +95,22 @@ mix run --no-halt
 restate --yes deployments register http://localhost:9082
 
 # Edit WORKFLOW.md → set tracker.project_slug to your Linear project slug.
-# Then trigger one issue end-to-end:
+
+# Trigger one issue end-to-end (slice 1+):
 mix symphony.dispatch SYM-1 --exec
+
+# OR boot the per-project poll loop (slice 3+):
+mix symphony.scheduler start your-project-slug --interval 30000 --exec
+
+# Snapshot the per-issue VO states across the project at any time:
+mix symphony.scheduler reconcile your-project-slug --exec
+
+# Halt the loop:
+mix symphony.scheduler stop your-project-slug --exec
+
+# `mix run --no-halt` also boots the Phoenix LiveView dashboard (slice 4+)
+# at http://localhost:4000 — auto-refreshes every 2s via SchedulerVO.reconcile,
+# expand any issue row to see its current attempt's conversation.
 ```
 
 `mix symphony.dispatch SYM-1` prints the curl, or pass `--exec` to run it. The
@@ -114,8 +137,8 @@ durable `conversation` via cold-path seeding.
 | 1.5 | Real `codex app-server` stdio session (single-shot port of upstream `SymphonyElixir.Codex.AppServer`); per-turn workspace ensure; auto-approval policy for non-interactive runs | **done (2026-05-05)** |
 | 2 | `1..max_turns` continuation loop in `IssueVO`; per-issue `Codex.Session` GenServer pinned to one BEAM node via Registry + DynamicSupervisor; cold-path conversation seeding rebuilds codex thread on cross-node failover from durable `conversation` state; per-turn Linear comments + tracker re-fetch between turns | **done (2026-05-05)** |
 | 2.5 | `IssueVO` slimmed to claim/dispatch; turn loop extracted into `RunAttemptWorkflow` (Workflow service, keyed `${id}::a${n}`); WORKFLOW.md content-hash pinned per attempt; node-local workspace preflight outside `ctx.run`; idempotent Linear comments via `(identifier, attempt_n, turn_n)` markers; idle-timeout for `Codex.Session`; `linear_graphql` dynamic tool so the agent can drive its own ticket | **done (2026-05-05)** |
-| 3 | Scheduler / poll loop; reconciliation; stall detection | not started |
-| 4 | Phoenix LiveView dashboard reading Restate journal | not started |
+| 3 | Codex turn extracted as `CodexTurnService` (Restate Service); workflow uses `ctx.call_async` + `ctx.timer` + `Awaitable.any` for the turn-vs-stall race; on stall, kills `Codex.Session` port and raises terminal failure; `IssueVO.read_state` shared handler for snapshots; `Linear.list_issues_in_project!`; `SchedulerVO` poll loop self-rescheduling via `ctx.send_async(invoke_at_ms:)` + `Awaitable.all` reconciliation across N issues; `mix symphony.scheduler {start,stop,tick,reconcile}` driver | **done (2026-05-06)** |
+| 4 | New `:symphony_dashboard` umbrella app: Phoenix 1.7 + LiveView 1.0 on `:4000`, single `OverviewLive` with 2s auto-refresh; `RestateClient` HTTP wrapper hitting Restate ingress for `SchedulerVO.reconcile` + `IssueVO.readState` + `RunAttemptWorkflow.readState`; click-to-expand attempt panels showing conversation, content-hash pin, workspace_path; stale-state badge surfaces ingress failure; no asset pipeline (Phoenix/LV JS served from each dep's priv/static) | **done (2026-05-06)** |
 | 5 | Chaos beats (`pkill` codex / BEAM node / Restate node) | not started |
 
 Demo readiness gate: see [`demo-engineering.md` §6](../demo-engineering.md).
