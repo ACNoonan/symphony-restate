@@ -35,5 +35,17 @@ defmodule Symphony.Runtime.Application do
         }
       ]
     })
+
+    Restate.Server.Registry.register_service(%{
+      name: "RunAttemptWorkflow",
+      type: :workflow,
+      handlers: [
+        %{
+          name: "run",
+          type: :workflow,
+          mfa: {Symphony.Runtime.RunAttemptWorkflow, :run, 2}
+        }
+      ]
+    })
   end
 end
