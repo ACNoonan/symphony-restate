@@ -10,5 +10,12 @@ defmodule SymphonyRestate.MixProject do
     ]
   end
 
-  defp deps, do: []
+  # Root deps live here so they are visible to every umbrella app via
+  # path-deps. Credo is required at compile time by the path-dep
+  # `restate_server`'s `Restate.Credo.Checks.NonDeterminism` module
+  # (which `use`s `Credo.Check`); without it, recompiling restate_server
+  # fails with `module Credo.Check is not loaded`.
+  defp deps, do: [
+    {:credo, "~> 1.7", only: [:dev, :test], runtime: false}
+  ]
 end

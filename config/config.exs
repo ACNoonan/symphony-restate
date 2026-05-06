@@ -9,7 +9,8 @@ config :restate_server, port: 9082
 config :symphony_runtime,
   workspace_root: System.tmp_dir!() |> Path.join("symphony_workspaces"),
   workflow_path: Path.expand("../WORKFLOW.md", __DIR__),
-  linear_endpoint: "https://api.linear.app/graphql"
+  linear_endpoint: "https://api.linear.app/graphql",
+  codex_session_idle_timeout_ms: :timer.minutes(5)
 
 if File.exists?(Path.join(__DIR__, "#{config_env()}.exs")) do
   import_config "#{config_env()}.exs"
