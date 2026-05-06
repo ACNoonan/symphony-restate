@@ -15,8 +15,8 @@ defmodule Symphony.Runtime.Application do
     end)
 
     children = [
-      # Slice 2 will add:
-      #   {Symphony.Runtime.Codex.Supervisor, []}
+      {Registry, keys: :unique, name: Symphony.Runtime.Codex.Registry},
+      Symphony.Runtime.Codex.Supervisor
     ]
 
     opts = [strategy: :one_for_one, name: Symphony.Runtime.Supervisor]

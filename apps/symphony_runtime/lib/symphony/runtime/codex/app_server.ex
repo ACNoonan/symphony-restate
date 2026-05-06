@@ -72,32 +72,70 @@ defmodule Symphony.Runtime.Codex.AppServer do
           turn_id: String.t()
         }
 
+  @type session :: %{port: port(), thread_id: String.t(), workspace: Path.t(), opts: opts()}
+
   @doc """
-  Run a single non-interactive turn end-to-end. Returns the
-  accumulated assistant text and the raw event stream on success.
+  Open a long-lived codex `app-server` session: spawn the port, run
+  the JSON-RPC handshake (`initialize` + `thread/start`), and return
+  the session struct. The caller owns the port; closing requires
+  `stop/1`. Use this for slice 2's pinned `Codex.Session` GenServer.
+  """
+  @spec start(Path.t(), opts()) :: {:ok, session()} | {:error, term()}
+  def start(workspace, opts \\ []) when is_binary(workspace) do
+    with {:ok, port} <- start_port(workspace, opts),
+         {:ok, thread_id} <- handshake(port, workspace, opts) do
+      {:ok, %{port: port, thread_id: thread_id, workspace: workspace, opts: opts}}
+    else
+      {:error, _} = err -> err
+    end
+  end
+
+  @doc """
+  Run one `turn/start` cycle on an already-open session and stream
+  until terminal. Returns `{:ok, result}` on `turn/completed` (with
+  accumulated agent text), or `{:error, reason}` on failure /
+  cancellation / port death. The session remains open; close it with
+  `stop/1`.
+  """
+  @spec turn(session(), String.t(), map(), opts()) :: {:ok, result()} | {:error, term()}
+  def turn(%{port: port, thread_id: thread_id, workspace: workspace} = session, prompt, issue, opts \\ [])
+      when is_binary(prompt) and is_map(issue) do
+    merged_opts = Keyword.merge(session.opts, opts)
+
+    case start_turn(port, thread_id, prompt, issue, workspace, merged_opts) do
+      {:ok, turn_id} ->
+        case stream_until_terminal(port, merged_opts) do
+          {:ok, %{text: text, events: events}} ->
+            {:ok, %{text: text, events: events, thread_id: thread_id, turn_id: turn_id}}
+
+          {:error, _} = err ->
+            err
+        end
+
+      {:error, _} = err ->
+        err
+    end
+  end
+
+  @doc "Close an open codex session's port. Idempotent."
+  @spec stop(session()) :: :ok
+  def stop(%{port: port}), do: stop_port(port)
+
+  @doc """
+  Convenience wrapper: open a session, run one turn, close it.
+  Used by slice 1.5's single-shot path; slice 2's `Codex.Session`
+  GenServer prefers `start/2` + `turn/4` + `stop/1` to keep the port
+  warm across turns.
   """
   @spec run(Path.t(), String.t(), map(), opts()) ::
           {:ok, result()} | {:error, term()}
   def run(workspace, prompt, issue, opts \\ [])
       when is_binary(workspace) and is_binary(prompt) and is_map(issue) do
-    with {:ok, port} <- start_port(workspace, opts),
-         {:ok, thread_id} <- handshake(port, workspace, opts) do
+    with {:ok, session} <- start(workspace, opts) do
       try do
-        case start_turn(port, thread_id, prompt, issue, workspace, opts) do
-          {:ok, turn_id} ->
-            case stream_until_terminal(port, opts) do
-              {:ok, %{text: text, events: events}} ->
-                {:ok, %{text: text, events: events, thread_id: thread_id, turn_id: turn_id}}
-
-              {:error, _} = err ->
-                err
-            end
-
-          {:error, _} = err ->
-            err
-        end
+        turn(session, prompt, issue, opts)
       after
-        stop_port(port)
+        stop(session)
       end
     end
   end

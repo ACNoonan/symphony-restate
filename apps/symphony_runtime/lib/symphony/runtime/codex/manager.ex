@@ -1,0 +1,85 @@
+defmodule Symphony.Runtime.Codex.Manager do
+  @moduledoc """
+  Public API for `IssueVO` to drive codex turns through pinned
+  long-lived `Codex.Session` GenServers.
+
+  Per-issue session affinity: looks up an existing Session for the
+  issue identifier in `Symphony.Runtime.Codex.Registry`; spawns one
+  via `Symphony.Runtime.Codex.Supervisor` if absent. The Session
+  outlives any single Restate invocation so subsequent turns reuse
+  the warm port + codex thread.
+
+  When the BEAM node dies, all Sessions die with it. Restate routes
+  the next `IssueVO` invocation to a different node; this Manager
+  on that node spawns a fresh Session; the Session's cold-path
+  seeding logic re-builds codex context from `IssueVO`'s durable
+  conversation state.
+  """
+
+  alias Symphony.Runtime.Codex.{Session, Supervisor, Registry}
+
+  @type turn_record :: Session.turn_record()
+
+  @doc """
+  Run one turn for the given issue. Spawns the Session if it doesn't
+  yet exist on this node.
+  """
+  @spec run_turn(
+          identifier :: String.t(),
+          workspace :: Path.t(),
+          prompt :: String.t(),
+          conversation_so_far :: [turn_record()],
+          issue_meta :: map(),
+          opts :: keyword()
+        ) :: {:ok, String.t()} | {:error, term()}
+  def run_turn(identifier, workspace, prompt, conversation_so_far, issue_meta, opts \\ []) do
+    case ensure_session(identifier, workspace, opts) do
+      {:ok, server} ->
+        Session.run_turn(server, %{
+          prompt: prompt,
+          conversation_so_far: conversation_so_far,
+          issue_meta: issue_meta,
+          app_server_opts: opts,
+          turn_timeout_ms: Keyword.get(opts, :turn_timeout_ms)
+        })
+
+      {:error, _} = err ->
+        err
+    end
+  end
+
+  @doc "Stop the Session for this issue (call after terminal state)."
+  @spec stop_session(String.t()) :: :ok
+  def stop_session(identifier) do
+    case Elixir.Registry.lookup(Registry, identifier) do
+      [{pid, _}] -> Session.stop(pid)
+      [] -> :ok
+    end
+  end
+
+  defp ensure_session(identifier, workspace, opts) do
+    case Elixir.Registry.lookup(Registry, identifier) do
+      [{pid, _}] ->
+        {:ok, pid}
+
+      [] ->
+        spec = {Session, [
+          name: Session.via(identifier),
+          workspace: workspace,
+          app_server_opts: opts
+        ]}
+
+        case Elixir.DynamicSupervisor.start_child(Supervisor, spec) do
+          {:ok, pid} ->
+            {:ok, pid}
+
+          {:error, {:already_started, pid}} ->
+            # Race between two callers. Either pid works.
+            {:ok, pid}
+
+          {:error, _} = err ->
+            err
+        end
+    end
+  end
+end

@@ -11,15 +11,15 @@ co-stars.
 | §3.1.4 Orchestrator (in-memory state) | **Removed as a component.** Each issue is its own Virtual Object. No central authority. |
 | §4.1.8 Orchestrator Runtime State | Distributed across VO state + Workflow journals. Never serialized as one object. |
 | §7.1 Issue States (`Unclaimed`/`Claimed`/`Running`/`RetryQueued`) | VO state machine. Single-writer guarantee makes "claimed" trivially correct. |
-| §7.2 Run Attempt (11 phases) | Workflow invocation. Each phase = a journal entry. Phases fall out of impl, not enumerated. |
-| §8.1 Poll Loop | Scheduled VO self-invocation via `ctx.send` w/ `delayMillis`. Suspends to ~$0 between ticks. |
-| §8.4 Retry/Backoff | `ctx.run` retry policy + `ctx.sleep`. Cancellable as a sub-invocation. |
-| §8.5 Stall Detection | `Awaitable.any([turn_complete, ctx.sleep(stall_ms)])` — wins or stalls, no math. |
-| §6.2 Dynamic `WORKFLOW.md` reload | **Replaced.** Workflow definition is a deployment artifact. Redeploy → new invocations use new config; in-flight finish on old. |
+| §7.2 Run Attempt (11 phases) | `RunAttemptWorkflow` invocation. Each durable boundary = a journal entry. The 11 phases fall out of implementation, not enum bookkeeping. |
+| §8.1 Poll Loop | `Scheduler` VO self-schedules with `ctx.send(..., invoke_at_ms:)` / `ctx.sleep`. Suspends to ~$0 between ticks. |
+| §8.4 Retry/Backoff | Workflow-level retry policy + durable timers. Cancellable because the run attempt is its own invocation, not a hidden local loop. |
+| §8.5 Stall Detection | `Awaitable.any([turn_complete, stall_timer])` where `turn_complete` is a durable completion handle, not a blocking local port read. |
+| §6.2 Dynamic `WORKFLOW.md` reload | **Replaced.** Workflow definition is a deployment artifact. Each attempt pins `workflow_version` / content hash; redeploy affects new attempts only. |
 | §5 `WORKFLOW.md` format | **Kept as-is.** External contract. |
 | §5.4 Liquid template rendering | Pure function in `:symphony_core`. Called from inside `ctx.run`. |
-| Linear adapter | Same external behavior. Each call wrapped in `ctx.run` for journaling. |
-| Codex stdio app-server | OTP-supervised port; per-turn input + output journaled via `ctx.run`. Process not durable; conversation is. |
+| Linear adapter | Same external behavior. Reads are journaled. Writes use deterministic markers / idempotency checks so retry cannot duplicate comments. |
+| Codex stdio app-server | OTP-supervised port. The process is not durable; turn requests, completions, transcript refs, and cancellation state are. |
 | Phoenix LiveView dashboard | Reads Restate admin API + journal queries instead of GenServer state. |
 
 ## Co-star design
@@ -32,16 +32,18 @@ runtimes need to be on screen, not one hidden behind the other.
 
 - `Codex.Session` GenServers — one per pinned issue, owns the stdio port.
 - `Codex.Supervisor` — `:one_for_one`, restarts a dead session on the same node.
-- Linear client GenServer pool, port draining on shutdown, telemetry pipelines.
+- Port draining on shutdown, telemetry pipelines, and optional backpressure /
+  rate-limit processes. HTTP connection pooling stays in Req/Finch unless we need
+  an actual stateful coordinator.
 - Phoenix LiveView dashboard process tree.
 
 ### What Restate does
 
 - `IssueVO` — durable claim state, `worker_node`, `turn_count`,
-  `conversation_journal_ref`. Single-writer per issue ID.
+  current attempt id, `conversation_journal_ref`. Single-writer per issue ID.
 - `RunAttemptWorkflow` — durable per-attempt: prepare workspace, render prompt,
-  send turn, await response, post comment, record outcome. Survives any handler
-  crash mid-flow.
+  request a Codex turn, await response, post comment idempotently, record
+  outcome. Survives any handler crash mid-flow.
 - Scheduler VO — durable poll-tick loop with `ctx.sleep`.
 - Cancellation propagation — terminal-state issue cancels live run as a
   sub-invocation.
@@ -53,17 +55,17 @@ runtimes need to be on screen, not one hidden behind the other.
 │                                                                  │
 │   ┌─────────────────────┐    ┌──────────────────────────────┐    │
 │   │ Codex.Supervisor    │    │ Restate Handler Endpoint     │    │
-│   │  └ Codex.Session    │◀───│  IssueVO.run_turn/2          │    │
-│   │     (port: codex    │    │  RunAttemptWorkflow.send/2   │    │
+│   │  └ Codex.Session    │◀───│  IssueVO.dispatch/2          │    │
+│   │     (port: codex    │    │  RunAttemptWorkflow.run/2    │    │
 │   │      app-server)    │    │                              │    │
 │   └─────────────────────┘    └──────────────────────────────┘    │
 │           ▲                              │                       │
-│           │ stdio turn I/O               │ ctx.run journals      │
-│           │ (fast, in-process)           │ each turn input/output│
+│           │ stdio turn I/O               │ journaled turn reqs   │
+│           │ (fast, in-process)           │ completions + refs    │
 │           │                              ▼                       │
 └───────────┼──────────────────────────────────────────────────────┘
             │
-            │ (worker_node = A in VO state)
+            │ (worker_node = A for observability only)
             │
             ▼
    ┌──────────────────────────┐
@@ -74,37 +76,110 @@ runtimes need to be on screen, not one hidden behind the other.
    └──────────────────────────┘
 ```
 
-### Failure beats
+## Durable/live boundary
 
-1. **Codex port dies (`pkill -9 codex`).** OTP supervisor restarts `Codex.Session`
-   on Node A. The next `IssueVO.run_turn` sees a fresh port; replays the
-   conversation from journal; continues. Pure OTP recovery.
-2. **BEAM Node A dies.** `Codex.Session` dies with it. Next `IssueVO.run_turn`
-   invocation is routed to Node B (Restate cluster decision). Node B has no
-   `Codex.Session` for this issue; it spawns one, replays the conversation from
-   the Workflow journal, continues. Co-star handoff.
-3. **Restate node dies mid-handler-call.** Restate cluster re-routes the
-   invocation; VO state untouched; the call retries durably. The OTP side never
-   notices because the durable state didn't move.
+The boundary rule: Restate owns decisions that must survive time; OTP owns
+processes that make the current node useful.
+
+That means a live Codex port is never treated as durable state. It is a cache of
+agent context with a process attached. The durable record is the turn request,
+the completion or failure, the transcript reference, the workflow version, and
+enough workspace metadata to restart on another node. If a BEAM node dies, the
+new node may lose the warm thread, but it must not lose the right to continue
+the attempt or duplicate externally visible writes.
+
+Slice 2 deliberately cheats this boundary for speed: `IssueVO` still calls
+`Codex.Manager.run_turn/6` inside `ctx.run`. That is acceptable for proving the
+port/session handoff, but it is not the final stall/cancellation shape. Before
+slice 3, Codex turn execution should be modeled as an awaitable/cancellable
+operation so `Awaitable.any([turn_complete, stall_timer])` is a real durable
+race rather than a comment around a blocking local call.
+
+### Failure beats (slice 2 implementation status)
+
+1. **Codex port dies (`pkill -9 codex`).** `Codex.Session.handle_info/2` catches
+   `{port, {:exit_status, _}}` and stops the GenServer. The DynamicSupervisor
+   does *not* auto-restart (transient). On the next `Manager.run_turn/6` the
+   Manager sees no Registry entry, spawns a fresh Session, and the cold-path
+   seeding (preamble built from durable `conversation` state) rehydrates codex.
+   Implemented in slice 2.
+2. **BEAM Node A dies.** `Codex.Session` and the Restate handler invocation
+   die with the BEAM. Restate's runtime detects the timeout and retries the
+   invocation; routing picks Node B. The IssueVO replay returns journaled
+   values for completed `ctx.run` blocks, then the next turn's `ctx.run`
+   re-executes — `Manager.run_turn/6` on Node B has no Session for this
+   issue, spawns one, the cold-path preamble rebuilds context. Co-star
+   handoff. Implemented in slice 2.
+
+   Final architecture note: re-executing a Codex turn is not always harmless.
+   Slice 2 relies on demo-scale behavior; slice 2.5 moves the attempt into a
+   Workflow and slice 3 makes the turn completion awaitable so Restate can
+   cancel or stall the turn at a durable boundary.
+3. **Restate cluster node dies mid-handler-call.** Restate cluster re-routes
+   the invocation; VO state untouched; the call retries durably. The OTP side
+   never notices because the durable state didn't move. Implemented at the
+   Restate-Elixir SDK layer; symphony-restate inherits it for free.
 
 ## Slice-by-slice architecture growth
 
-| Slice | New components | New design risk |
+| Slice | New components | Status |
 |---|---|---|
-| 0 | Umbrella, deps, types | None. |
-| 1 | `Symphony.Core.Workflow` parser; `IssueVO` (single-method, `dispatch/0`); single-turn `RunAttemptWorkflow`; `Codex.Session` (one-shot turn); minimal Linear adapter. | Restate-Elixir handler discovery + endpoint registration — first time we run a non-greeter handler. |
-| 2 | `max_turns` loop in `RunAttemptWorkflow`; pinned-session lifecycle in `Codex.Session`; conversation replay on respawn. | Worker-node affinity routing. May need a `restate-elixir` SDK addition. |
-| 3 | `Scheduler` VO (poll-tick); reconciliation across N issues (`Awaitable.all`); stall detection (`Awaitable.any`). | First fan-out concurrency in real Symphony workload. |
-| 4 | Phoenix LiveView dashboard; reads Restate admin API + journals. | Live updates from Restate-side state changes (likely PubSub-bridged). |
-| 5 | Chaos hooks (kill codex / kill BEAM node / kill Restate node); demo-script E2E. | None new — exercise of slices 1–4 under chaos. |
+| 0 | Umbrella, deps, types | done |
+| 1 | `Symphony.Core.Workflow` parser; `Symphony.Core.Prompt` (Solid Liquid render); `IssueVO.dispatch` (single turn, stub codex); `Symphony.Runtime.Linear` (fetch/post-comment); `mix symphony.dispatch` task. | done |
+| 1.5 | `Symphony.Runtime.Codex.AppServer` — minimal port of upstream's stdio JSON-RPC client (single-shot `run/4`); auto-approval policy; `Codex.Workspace.ensure!/2`. | done |
+| 2 | `Codex.AppServer.start/2` + `turn/4` + `stop/1` (broken out so port stays warm); `Codex.Session` GenServer (long-lived port + thread, cold-path seeding); `Codex.Supervisor` DynamicSupervisor + `Codex.Registry`; `Codex.Manager` find-or-spawn API; `IssueVO` `1..max_turns` loop with durable `conversation` state; per-turn Linear comment; mid-loop tracker re-fetch + terminal-state break; `Codex.Manager.stop_session/1` on terminal. | done |
+| 2.5 | Extract `RunAttemptWorkflow` (separate Workflow service type); pin workflow hash per attempt; make tracker comments idempotent; fix node-local workspace preflight; `Codex.Session` idle timeout; `linear_graphql` dynamic tool. | not started |
+| 3 | `Scheduler` VO (poll-tick); reconciliation across N issues (`Awaitable.all`); Codex turn awaitable/cancellable boundary; stall detection (`Awaitable.any`). | not started |
+| 4 | Phoenix LiveView dashboard; reads Restate admin API + journals. | not started |
+| 5 | Chaos hooks (kill codex / kill BEAM node / kill Restate node); demo-script E2E. | not started |
 
-## Open architectural items
+## Resolved architectural items (slice 2)
 
-- **Worker-node affinity.** `IssueVO` knows `worker_node`; how does the Restate
-  handler endpoint route the next call to that node? Likely `ctx.run` returning the
-  current node-id and a `restate-elixir` helper for "send to specific endpoint" — TBD
-  in slice 2.
-- **Rendezvous on dead pin.** When `worker_node` is unreachable, what's the exact
-  recovery sequence? Needs a small design doc before slice 2.
-- **HTTP/2 same-stream suspend/resume.** Long codex turns will exercise the
-  REQUEST_RESPONSE-only path in `restate-elixir` v0.2.0. May force the v0.3 work.
+- ~~**Worker-node affinity.**~~ Resolved by *not* tracking it explicitly.
+  `IssueVO` runs wherever Restate routes it; `Codex.Manager` finds-or-spawns a
+  Session local to that node via Registry. The "affinity" is implicit in
+  Restate's routing decisions; no SDK addition needed for slice 2. We do
+  persist `worker_node` to VO state for observability, but it's never read for
+  routing.
+- ~~**Rendezvous on dead pin.**~~ Replaced with the cold-path seeding pattern in
+  `Codex.Session`: when a fresh Session sees `expected_completed_turns >
+  completed_turns`, it prepends a "Prior conversation" preamble to the next
+  prompt, catching codex up in one extra round-trip. No separate seed turn,
+  no wasted assistant reply. Trade-off: prompt size grows linearly with turn
+  count, mitigated by codex's prompt caching.
+
+## Architectural invariants
+
+- **No central orchestrator process.** Scheduling can be centralized as a
+  durable VO tick, but issue correctness always lives at the per-issue key.
+- **No durable illusion around ports.** A `Codex.Session` may die at any time.
+  Durable state must be sufficient to restart on a different BEAM node.
+- **No blocking local call where the design promises a durable race.** Stall
+  detection, cancellation, and long-turn recovery need Restate awaitables or
+  sub-invocations, not a GenServer call hidden inside `ctx.run`.
+- **No unkeyed external writes.** Linear comments, branch pushes, and any future
+  tracker/file-system writes need deterministic markers or idempotency keys.
+- **No node-local path in the journal unless storage is shared.** If a workspace
+  path is replayed on another node, either the path must point at shared storage
+  or the new node must run an idempotent local preflight before Codex uses it.
+
+## Still open
+
+- **HTTP/2 same-stream suspend/resume.** Long codex turns (hour-scale) will
+  exercise the REQUEST_RESPONSE-only path in `restate-elixir` v0.2.0. Slice 2
+  builds run successfully but real long-turn smoke testing may force the v0.3
+  work — flagged for the SDK side.
+- **Conversation state size.** Restate VO state has size limits; long-running
+  issues (20 turns × N kB each) may hit them. Slice 2 punts on compaction;
+  slice 3 may move the conversation to per-turn blobs / durable promises,
+  summarize older turns, or store compressed refs instead of full text.
+- **`Codex.Session` idle timeout.** Sessions live until the issue terminates.
+  For polling demos with 100s of issues, this could exhaust file descriptors.
+  Slice 2.5 adds a timeout.
+- **Idempotent Linear writes.** `ctx.run` prevents replay after a committed run
+  result, but cannot prove Linear did not receive a comment when the response is
+  lost before journaling. Comments need deterministic markers and reconciliation.
+- **Workspace locality.** `Workspace.ensure!/2` currently runs inside `ctx.run`.
+  If the journaled workspace path was created on Node A and replay resumes on
+  Node B, the path is only valid when the workspace root is shared. Node-local
+  workspaces need an idempotent preflight outside the replayed value path.

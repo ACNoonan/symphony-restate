@@ -1,27 +1,37 @@
 defmodule Symphony.Runtime.IssueVO do
   @moduledoc """
-  Per-issue Restate Virtual Object. Keyed by Linear issue identifier
-  (e.g. `"SYM-1"`).
+  Per-issue Restate Virtual Object. Keyed by Linear issue identifier.
 
-  Single handler in slice 1: `dispatch/2` runs one full cycle —
-  load workflow, fetch issue, render prompt, run one (stub) codex
-  turn, post comment back. Every external side effect is wrapped in
-  `Restate.Context.run/2` so the journal is the durable record of
-  the run.
+  Slice 2 lifecycle:
 
-  The single-writer guarantee on the `:exclusive` handler makes the
-  `claim_status` state field a trivially-correct claim guard:
-  re-invoking `dispatch` while one is already running just sees the
-  existing state and bails.
+    1. Claim guard via VO state (`claim_status`).
+    2. Load WORKFLOW.md, fetch issue, ensure workspace (each via
+       `ctx.run` — durable side effects).
+    3. Run the `1..max_turns` turn loop. Each turn:
+       a. Render prompt (with `attempt: N` for continuations).
+       b. Drive `Codex.Manager.run_turn/6`. Manager finds/spawns a
+          long-lived `Codex.Session` for this issue on the current
+          BEAM node; the Session keeps the codex port + thread hot
+          across turns. Cross-node failover is handled inside the
+          Session via cold-path conversation seeding from the
+          durable `conversation` state below.
+       c. Append `%{turn, prompt, response}` to `conversation` state
+          and write back via `ctx.set_state/3`.
+       d. Post a Linear comment with the turn output.
+       e. Re-fetch the issue from Linear (`SPEC.md` §8.5 reconcile
+          parity). If the tracker state is now terminal, break.
+    4. Stop the local Session, mark `claim_status = "done"`.
 
-  ## Slice 1 vs later
+  ## Co-star handoff
 
-  Slice 1 inlines the run-attempt logic directly. Slice 2 will
-  extract a separate `Symphony.Runtime.RunAttemptWorkflow` (Restate
-  Workflow service type) and add the `max_turns` continuation loop +
-  `Codex.Session` OTP supervisor. The codex turn here is a
-  deterministic stub; real codex stdio integration ships in slice
-  1.5 / slice 2.
+  Restate routes this VO to whichever node is healthy. On the active
+  node, `Codex.Manager` finds an OTP-supervised Session for this
+  issue keyed by identifier. When the BEAM dies, the Session dies
+  with it; Restate retries the invocation on a different node;
+  `Codex.Manager` there spawns a fresh Session; the Session's
+  cold-path seeding rehydrates codex from `conversation` state.
+  Both substrates are visible: OTP supervises the hot port, Restate
+  supervises the durable state + cross-node movement.
   """
 
   require Logger
@@ -29,9 +39,13 @@ defmodule Symphony.Runtime.IssueVO do
   alias Restate.Context
   alias Symphony.Core.{Prompt, Workflow}
   alias Symphony.Runtime.Linear
-  alias Symphony.Runtime.Codex.{AppServer, Workspace}
+  alias Symphony.Runtime.Codex.{Manager, Workspace}
 
-  @doc "Restate handler. Input is ignored; state lives in the VO."
+  @default_max_turns 20
+
+  @default_terminal_states ~w(done closed cancelled canceled duplicate)
+
+  @doc "Restate handler. Drives one full attempt of the turn loop."
   def dispatch(%Context{} = ctx, _input) do
     identifier = Context.key(ctx)
     Logger.metadata(issue_identifier: identifier)
@@ -45,7 +59,15 @@ defmodule Symphony.Runtime.IssueVO do
 
       _ ->
         Context.set_state(ctx, "claim_status", "running")
-        run_attempt(ctx, identifier)
+        Context.set_state(ctx, "worker_node", to_string(node()))
+
+        try do
+          run_attempt(ctx, identifier)
+        rescue
+          e ->
+            Context.set_state(ctx, "claim_status", "failed")
+            reraise e, __STACKTRACE__
+        end
     end
   end
 
@@ -60,9 +82,7 @@ defmodule Symphony.Runtime.IssueVO do
             {config, tmpl}
 
           {:error, reason} ->
-            raise Restate.TerminalError,
-              code: 500,
-              message: "workflow_load_failed: #{inspect(reason)}"
+            terminal!("workflow_load_failed", reason)
         end
       end)
 
@@ -76,60 +96,117 @@ defmodule Symphony.Runtime.IssueVO do
         Workspace.ensure!(issue, workspace_root)
       end)
 
-    rendered_prompt =
-      Context.run(ctx, fn ->
-        case Prompt.render(prompt_template, %{issue: issue, attempt: nil}) do
-          {:ok, p} ->
-            p
+    max_turns = get_in(workflow_config, ["agent", "max_turns"]) || @default_max_turns
+    terminal_states = terminal_states_from_config(workflow_config)
+    codex_opts = codex_opts_from_config(workflow_config)
 
-          {:error, reason} ->
-            raise Restate.TerminalError,
-              code: 500,
-              message: "prompt_render_failed: #{inspect(reason)}"
+    final =
+      Enum.reduce_while(1..max_turns, %{issue: issue, conversation: []}, fn turn_n, acc ->
+        run_one_turn(ctx, identifier, workspace, prompt_template, codex_opts, terminal_states, max_turns, turn_n, acc)
+      end)
+
+    Context.run(ctx, fn ->
+      Manager.stop_session(identifier)
+      :ok
+    end)
+
+    Context.set_state(ctx, "claim_status", "done")
+
+    final
+  end
+
+  defp run_one_turn(ctx, identifier, workspace, prompt_template, codex_opts, terminal_states, max_turns, turn_n, acc) do
+    attempt = if turn_n == 1, do: nil, else: turn_n
+
+    prompt =
+      Context.run(ctx, fn ->
+        case Prompt.render(prompt_template, %{issue: acc.issue, attempt: attempt}) do
+          {:ok, p} -> p
+          {:error, reason} -> terminal!("prompt_render_failed", reason)
         end
       end)
 
-    turn_output =
+    response =
       Context.run(ctx, fn ->
-        codex_turn!(workspace, rendered_prompt, issue, workflow_config)
+        issue_meta = %{identifier: acc.issue.identifier, title: acc.issue.title || ""}
+
+        case Manager.run_turn(identifier, workspace, prompt, acc.conversation, issue_meta, codex_opts) do
+          {:ok, ""} ->
+            "[symphony-restate] codex turn completed without an extractable agent message; check the Restate journal for raw events."
+
+          {:ok, text} ->
+            text
+
+          {:error, reason} ->
+            terminal!("codex_turn_failed", reason)
+        end
       end)
+
+    new_record = %{"turn" => turn_n, "prompt" => prompt, "response" => response}
+    new_conversation = acc.conversation ++ [new_record]
 
     comment_id =
       Context.run(ctx, fn ->
-        Linear.post_comment!(issue.id, turn_output)
+        Linear.post_comment!(acc.issue.id, format_turn_comment(turn_n, max_turns, response))
       end)
 
-    Context.set_state(ctx, "turn_count", 1)
+    Context.set_state(ctx, "conversation", new_conversation)
+    Context.set_state(ctx, "turn_count", turn_n)
     Context.set_state(ctx, "last_comment_id", comment_id)
-    Context.set_state(ctx, "claim_status", "done")
 
-    %{
-      ok: true,
-      identifier: identifier,
-      issue_id: issue.id,
-      comment_id: comment_id,
-      turn: 1
-    }
+    cond do
+      turn_n >= max_turns ->
+        {:halt,
+         %{
+           ok: true,
+           identifier: identifier,
+           issue_id: acc.issue.id,
+           turns: turn_n,
+           ended_by: :max_turns
+         }}
+
+      true ->
+        refreshed =
+          Context.run(ctx, fn ->
+            Linear.fetch_issue!(identifier)
+          end)
+
+        if String.downcase(refreshed.state || "") in terminal_states do
+          {:halt,
+           %{
+             ok: true,
+             identifier: identifier,
+             issue_id: acc.issue.id,
+             turns: turn_n,
+             ended_by: :tracker_terminal,
+             final_state: refreshed.state
+           }}
+        else
+          {:cont, %{issue: refreshed, conversation: new_conversation}}
+        end
+    end
   end
 
-  defp codex_turn!(workspace, prompt, issue, workflow_config) do
-    opts = codex_opts_from_config(workflow_config)
-    issue_meta = %{identifier: issue.identifier, title: issue.title || ""}
+  defp terminal!(label, reason) do
+    raise Restate.TerminalError,
+      code: 500,
+      message: "#{label}: #{inspect(reason)}"
+  end
 
-    case AppServer.run(workspace, prompt, issue_meta, opts) do
-      {:ok, %{text: text}} when text != "" ->
-        text
-
-      {:ok, %{text: ""}} ->
-        # Codex completed without emitting any text we recognized.
-        # Surface a useful message rather than posting an empty comment.
-        "[symphony-restate] codex turn completed without an extractable agent message; check Restate journal for raw events."
-
-      {:error, reason} ->
-        raise Restate.TerminalError,
-          code: 500,
-          message: "codex_turn_failed: #{inspect(reason)}"
+  defp terminal_states_from_config(config) do
+    case get_in(config, ["tracker", "terminal_states"]) do
+      list when is_list(list) -> Enum.map(list, &String.downcase/1)
+      _ -> @default_terminal_states
     end
+  end
+
+  defp format_turn_comment(turn_n, max_turns, text) do
+    """
+    🎼 **symphony-restate — turn #{turn_n}/#{max_turns}**
+
+    #{text}
+    """
+    |> String.trim()
   end
 
   defp codex_opts_from_config(%{"codex" => codex}) when is_map(codex) do
