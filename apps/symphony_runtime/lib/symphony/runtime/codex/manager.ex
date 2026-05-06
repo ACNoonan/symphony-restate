@@ -23,6 +23,10 @@ defmodule Symphony.Runtime.Codex.Manager do
   @doc """
   Run one turn for the given issue. Spawns the Session if it doesn't
   yet exist on this node.
+
+  Tolerates a single race against a Session that just died (idle
+  timeout, port exit, or supervisor decision): if the call exits
+  with `:noproc` or `:normal`, force a respawn and retry once.
   """
   @spec run_turn(
           identifier :: String.t(),
@@ -33,18 +37,25 @@ defmodule Symphony.Runtime.Codex.Manager do
           opts :: keyword()
         ) :: {:ok, String.t()} | {:error, term()}
   def run_turn(identifier, workspace, prompt, conversation_so_far, issue_meta, opts \\ []) do
-    case ensure_session(identifier, workspace, opts) do
-      {:ok, server} ->
-        Session.run_turn(server, %{
-          prompt: prompt,
-          conversation_so_far: conversation_so_far,
-          issue_meta: issue_meta,
-          app_server_opts: opts,
-          turn_timeout_ms: Keyword.get(opts, :turn_timeout_ms)
-        })
+    do_run_turn(identifier, workspace, prompt, conversation_so_far, issue_meta, opts, _retried? = false)
+  end
 
-      {:error, _} = err ->
-        err
+  defp do_run_turn(identifier, workspace, prompt, conversation_so_far, issue_meta, opts, retried?) do
+    payload = %{
+      prompt: prompt,
+      conversation_so_far: conversation_so_far,
+      issue_meta: issue_meta,
+      app_server_opts: opts,
+      turn_timeout_ms: Keyword.get(opts, :turn_timeout_ms)
+    }
+
+    with {:ok, server} <- ensure_session(identifier, workspace, opts) do
+      try do
+        Session.run_turn(server, payload)
+      catch
+        :exit, {reason, _mfa} when reason in [:noproc, :normal] and not retried? ->
+          do_run_turn(identifier, workspace, prompt, conversation_so_far, issue_meta, opts, true)
+      end
     end
   end
 

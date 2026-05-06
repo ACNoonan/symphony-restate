@@ -28,6 +28,11 @@ defmodule Symphony.Runtime.Codex.Session do
     * `handle_info({port, {:exit_status, _}})` — codex exited; the
       Session stops itself. The DynamicSupervisor leaves it dead;
       the next `Manager.run_turn/5` spawns a fresh one.
+    * `handle_info(:timeout, _)` — idle timeout. The Session stops
+      cleanly so a polling fleet doesn't pile up file descriptors
+      on issues that have gone quiet between ticks. The next turn
+      spawns a fresh Session and rebuilds context via cold-path
+      seeding from the durable `conversation`.
   """
 
   use GenServer, restart: :transient
@@ -84,17 +89,30 @@ defmodule Symphony.Runtime.Codex.Session do
   def init(opts) do
     workspace = Keyword.fetch!(opts, :workspace)
     app_server_opts = Keyword.get(opts, :app_server_opts, [])
+    idle_timeout_ms = Keyword.get(opts, :idle_timeout_ms, default_idle_timeout_ms())
 
     case AppServer.start(workspace, app_server_opts) do
       {:ok, session} ->
         Logger.info(fn -> "codex session opened thread_id=#{session.thread_id}" end)
         Process.flag(:trap_exit, true)
-        {:ok, %{session: session, completed_turns: 0, app_server_opts: app_server_opts}}
+
+        state = %{
+          session: session,
+          completed_turns: 0,
+          app_server_opts: app_server_opts,
+          idle_timeout_ms: idle_timeout_ms
+        }
+
+        {:ok, state, state.idle_timeout_ms}
 
       {:error, reason} ->
         Logger.error(fn -> "codex session start failed: #{inspect(reason)}" end)
         {:stop, {:codex_start_failed, reason}}
     end
+  end
+
+  defp default_idle_timeout_ms do
+    Application.get_env(:symphony_runtime, :codex_session_idle_timeout_ms, :timer.minutes(5))
   end
 
   @impl true
@@ -129,7 +147,7 @@ defmodule Symphony.Runtime.Codex.Session do
         # `expected_completed + 1` covers cold-path seeding + the new
         # turn in a single AppServer.turn call.
         new_state = %{state | completed_turns: expected_completed + 1}
-        {:reply, {:ok, text}, new_state}
+        {:reply, {:ok, text}, new_state, new_state.idle_timeout_ms}
 
       {:error, reason} = err ->
         # Port is likely toast; stop so the supervisor doesn't keep a
@@ -146,7 +164,15 @@ defmodule Symphony.Runtime.Codex.Session do
     {:stop, {:codex_port_exit, status}, state}
   end
 
-  def handle_info(_msg, state), do: {:noreply, state}
+  def handle_info(:timeout, state) do
+    Logger.info(fn ->
+      "codex session idle for #{state.idle_timeout_ms}ms — stopping; next turn will respawn"
+    end)
+
+    {:stop, :normal, state}
+  end
+
+  def handle_info(_msg, state), do: {:noreply, state, state.idle_timeout_ms}
 
   @impl true
   def terminate(_reason, %{session: session}) do

@@ -220,7 +220,8 @@ defmodule Symphony.Runtime.Codex.AppServer do
         "approvalPolicy" => Keyword.get(opts, :approval_policy, @default_approval_policy),
         "sandbox" => Keyword.get(opts, :thread_sandbox, @default_thread_sandbox),
         "cwd" => workspace,
-        "dynamicTools" => []
+        "dynamicTools" =>
+          Keyword.get(opts, :dynamic_tools, Symphony.Runtime.Codex.DynamicTool.tool_specs())
       }
     })
 
@@ -329,20 +330,17 @@ defmodule Symphony.Runtime.Codex.AppServer do
     :handled
   end
 
-  defp maybe_handle_approval(port, "item/tool/call", %{"id" => id} = _payload) do
-    # Slice 1.5 has no dynamic tools registered. If codex calls one
-    # anyway we reply with a structured failure so it can move on.
-    send_message(port, %{
-      "id" => id,
-      "result" => %{
-        "success" => false,
-        "output" => "no dynamic tools registered (slice 1.5)",
-        "contentItems" => [
-          %{"type" => "inputText", "text" => "no dynamic tools registered (slice 1.5)"}
-        ]
-      }
-    })
+  defp maybe_handle_approval(port, "item/tool/call", %{"id" => id, "params" => params}) do
+    # Slice 2.5: dispatch dynamic tool calls (currently `linear_graphql`)
+    # to `Codex.DynamicTool.execute/2`. Failures are returned as
+    # `success: false` so the turn can continue, never raised — the
+    # AppServer's stream loop must not crash on a tool error.
+    tool = Map.get(params, "name") || Map.get(params, "tool")
+    arguments = Map.get(params, "arguments") || Map.get(params, "input") || %{}
 
+    result = Symphony.Runtime.Codex.DynamicTool.execute(tool, arguments)
+
+    send_message(port, %{"id" => id, "result" => result})
     :handled
   end
 
