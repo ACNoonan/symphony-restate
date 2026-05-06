@@ -32,6 +32,11 @@ defmodule Symphony.Runtime.Application do
           name: "dispatch",
           type: :exclusive,
           mfa: {Symphony.Runtime.IssueVO, :dispatch, 2}
+        },
+        %{
+          name: "readState",
+          type: :shared,
+          mfa: {Symphony.Runtime.IssueVO, :read_state, 2}
         }
       ]
     })
@@ -44,6 +49,50 @@ defmodule Symphony.Runtime.Application do
           name: "run",
           type: :workflow,
           mfa: {Symphony.Runtime.RunAttemptWorkflow, :run, 2}
+        },
+        %{
+          name: "readState",
+          type: :shared,
+          mfa: {Symphony.Runtime.RunAttemptWorkflow, :read_state, 2}
+        }
+      ]
+    })
+
+    Restate.Server.Registry.register_service(%{
+      name: "CodexTurnService",
+      type: :service,
+      handlers: [
+        %{
+          name: "run",
+          type: nil,
+          mfa: {Symphony.Runtime.CodexTurnService, :run, 2}
+        }
+      ]
+    })
+
+    Restate.Server.Registry.register_service(%{
+      name: "SchedulerVO",
+      type: :virtual_object,
+      handlers: [
+        %{
+          name: "start",
+          type: :exclusive,
+          mfa: {Symphony.Runtime.SchedulerVO, :start, 2}
+        },
+        %{
+          name: "stop",
+          type: :exclusive,
+          mfa: {Symphony.Runtime.SchedulerVO, :stop, 2}
+        },
+        %{
+          name: "tick",
+          type: :exclusive,
+          mfa: {Symphony.Runtime.SchedulerVO, :tick, 2}
+        },
+        %{
+          name: "reconcile",
+          type: :shared,
+          mfa: {Symphony.Runtime.SchedulerVO, :reconcile, 2}
         }
       ]
     })

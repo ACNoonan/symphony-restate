@@ -79,13 +79,34 @@ defmodule Symphony.Runtime.RunAttemptWorkflow do
 
   require Logger
 
-  alias Restate.Context
+  alias Restate.{Awaitable, Context}
   alias Symphony.Core.{Issue, Prompt, Workflow}
   alias Symphony.Runtime.Linear
   alias Symphony.Runtime.Codex.{Manager, Workspace}
 
   @default_max_turns 20
   @default_terminal_states ~w(done closed cancelled canceled duplicate)
+  @default_stall_timeout_ms :timer.minutes(5)
+  @codex_turn_service "CodexTurnService"
+  @codex_turn_handler "run"
+
+  @doc """
+  Shared handler. Returns a snapshot of this attempt's workflow
+  state so the LiveView dashboard (slice 4) can render the
+  conversation without driving anything. Workflow `:shared`
+  handlers can run concurrently with `run` and with each other.
+  Missing keys come back as `nil` until `run` writes them.
+  """
+  def read_state(%Context{} = ctx, _input) do
+    %{
+      "workflow_key" => Context.key(ctx),
+      "workflow_content_hash" => Context.get_state(ctx, "workflow_content_hash"),
+      "workspace_path" => Context.get_state(ctx, "workspace_path"),
+      "conversation" => Context.get_state(ctx, "conversation") || [],
+      "turn_count" => Context.get_state(ctx, "turn_count"),
+      "last_comment_id" => Context.get_state(ctx, "last_comment_id")
+    }
+  end
 
   @doc "Workflow `run` handler. One-shot per workflow key."
   def run(%Context{} = ctx, input) when is_map(input) do
@@ -117,6 +138,7 @@ defmodule Symphony.Runtime.RunAttemptWorkflow do
     max_turns = get_in(workflow_config, ["agent", "max_turns"]) || @default_max_turns
     terminal_states = terminal_states_from_config(workflow_config)
     codex_opts = codex_opts_from_config(workflow_config)
+    stall_timeout_ms = stall_timeout_from_config(workflow_config)
 
     final =
       Enum.reduce_while(1..max_turns, %{"issue" => issue_map, "conversation" => []}, fn turn_n,
@@ -131,7 +153,8 @@ defmodule Symphony.Runtime.RunAttemptWorkflow do
             codex_opts: codex_opts,
             terminal_states: terminal_states,
             max_turns: max_turns,
-            turn_n: turn_n
+            turn_n: turn_n,
+            stall_timeout_ms: stall_timeout_ms
           },
           acc
         )
@@ -191,7 +214,8 @@ defmodule Symphony.Runtime.RunAttemptWorkflow do
       codex_opts: codex_opts,
       terminal_states: terminal_states,
       max_turns: max_turns,
-      turn_n: turn_n
+      turn_n: turn_n,
+      stall_timeout_ms: stall_timeout_ms
     } = ctx_args
 
     attempt_label = if turn_n == 1, do: nil, else: turn_n
@@ -205,39 +229,16 @@ defmodule Symphony.Runtime.RunAttemptWorkflow do
       end)
 
     response =
-      Context.run(ctx, fn ->
-        issue_meta = %{
-          identifier: acc["issue"]["identifier"],
-          title: acc["issue"]["title"] || ""
-        }
-
-        conversation_for_session =
-          Enum.map(acc["conversation"], fn rec ->
-            %{
-              turn: rec["turn"],
-              prompt: rec["prompt"],
-              response: rec["response"]
-            }
-          end)
-
-        case Manager.run_turn(
-               identifier,
-               workspace_path,
-               prompt,
-               conversation_for_session,
-               issue_meta,
-               codex_opts
-             ) do
-          {:ok, ""} ->
-            "[symphony-restate] codex turn completed without an extractable agent message; check the Restate journal for raw events."
-
-          {:ok, text} ->
-            text
-
-          {:error, reason} ->
-            terminal!("codex_turn_failed", reason)
-        end
-      end)
+      run_turn_with_stall_detection(
+        ctx,
+        identifier,
+        workspace_path,
+        prompt,
+        acc["conversation"],
+        acc["issue"],
+        codex_opts,
+        stall_timeout_ms
+      )
 
     new_record = %{"turn" => turn_n, "prompt" => prompt, "response" => response}
     new_conversation = acc["conversation"] ++ [new_record]
@@ -286,6 +287,74 @@ defmodule Symphony.Runtime.RunAttemptWorkflow do
     end
   end
 
+  # Race the codex turn (a `call_async` to `CodexTurnService`)
+  # against a `ctx.timer` stall timer via `Awaitable.any/2`.
+  #
+  #   * Turn wins → return its text.
+  #   * Stall wins → kill the local Codex.Session port (so the
+  #     in-flight turn at the OTP layer abandons its work and the
+  #     port resources release) and raise a terminal failure for
+  #     the attempt.
+  #
+  # Restate's CANCEL signal can't preempt code already executing
+  # inside the CodexTurnService's `ctx.run`. The port-kill is the
+  # OTP-side preemption that meets the cancel signal halfway:
+  # the Session's `handle_info({port, {:exit_status, _}}, ...)`
+  # stops the GenServer, the in-flight `Manager.run_turn` returns
+  # `{:error, {:port_exit, _}}` from `AppServer.turn`, and the
+  # CodexTurnService's `ctx.run` proposes that as a terminal
+  # failure on its own — at which point our `call_async` handle
+  # also resolves with the failure (already abandoned because we
+  # took the stall branch).
+  defp run_turn_with_stall_detection(
+         ctx,
+         identifier,
+         workspace_path,
+         prompt,
+         conversation,
+         issue,
+         codex_opts,
+         stall_timeout_ms
+       ) do
+    payload = %{
+      "identifier" => identifier,
+      "workspace_path" => workspace_path,
+      "prompt" => prompt,
+      "conversation_so_far" => conversation,
+      "issue_meta" => %{
+        "identifier" => issue["identifier"],
+        "title" => issue["title"] || ""
+      },
+      "codex_opts" => keyword_to_string_map(codex_opts)
+    }
+
+    turn_handle = Context.call_async(ctx, @codex_turn_service, @codex_turn_handler, payload)
+    stall_handle = Context.timer(ctx, stall_timeout_ms)
+
+    case Awaitable.any(ctx, [turn_handle, stall_handle]) do
+      {0, %{"text" => text}} when is_binary(text) and text != "" ->
+        text
+
+      {0, %{"text" => ""}} ->
+        "[symphony-restate] codex turn completed without an extractable agent message; check the Restate journal for raw events."
+
+      {0, other} ->
+        terminal!("codex_turn_invalid_response", other)
+
+      {1, :ok} ->
+        # Stall fired. Kill the port so the abandoned in-flight turn
+        # releases its file descriptors instead of running to its
+        # own (long) timeout. Recorded inside `ctx.run` so the kill
+        # is journaled as part of the stall handling.
+        Context.run(ctx, fn ->
+          Manager.stop_session(identifier)
+          :ok
+        end)
+
+        terminal!("codex_turn_stall", %{stall_timeout_ms: stall_timeout_ms})
+    end
+  end
+
   # ---------------------- Helpers ----------------------
 
   defp terminal!(label, reason) do
@@ -323,6 +392,21 @@ defmodule Symphony.Runtime.RunAttemptWorkflow do
   end
 
   defp codex_opts_from_config(_), do: []
+
+  defp stall_timeout_from_config(config) do
+    case get_in(config, ["codex", "stall_timeout_ms"]) do
+      ms when is_integer(ms) and ms > 0 -> ms
+      _ -> @default_stall_timeout_ms
+    end
+  end
+
+  # CodexTurnService input is JSON-decoded as an object, so codex_opts
+  # must travel as a string-keyed map (not a Keyword list).
+  defp keyword_to_string_map(opts) when is_list(opts) do
+    Map.new(opts, fn {k, v} -> {Atom.to_string(k), v} end)
+  end
+
+  defp keyword_to_string_map(_), do: %{}
 
   defp maybe_put(opts, source, source_key, dest_key) do
     case Map.get(source, source_key) do

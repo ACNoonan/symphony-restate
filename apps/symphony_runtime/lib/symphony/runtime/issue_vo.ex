@@ -47,6 +47,25 @@ defmodule Symphony.Runtime.IssueVO do
   @workflow_service "RunAttemptWorkflow"
   @workflow_handler "run"
 
+  @doc """
+  Restate handler. Returns a snapshot of this VO's state so an
+  external orchestrator (the `SchedulerVO` reconciliation path,
+  the LiveView dashboard in slice 4) can read claim status without
+  triggering a fresh dispatch. JSON-safe map; missing keys come
+  back as `nil`.
+  """
+  def read_state(%Context{} = ctx, _input) do
+    identifier = Context.key(ctx)
+
+    %{
+      "identifier" => identifier,
+      "claim_status" => Context.get_state(ctx, "claim_status"),
+      "last_attempt_n" => Context.get_state(ctx, "last_attempt_n"),
+      "last_attempt_result" => Context.get_state(ctx, "last_attempt_result"),
+      "worker_node" => Context.get_state(ctx, "worker_node")
+    }
+  end
+
   @doc "Restate handler. Dispatches one new attempt for this issue."
   def dispatch(%Context{} = ctx, _input) do
     identifier = Context.key(ctx)
