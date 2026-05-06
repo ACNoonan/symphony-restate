@@ -128,7 +128,7 @@ race rather than a comment around a blocking local call.
 | 1 | `Symphony.Core.Workflow` parser; `Symphony.Core.Prompt` (Solid Liquid render); `IssueVO.dispatch` (single turn, stub codex); `Symphony.Runtime.Linear` (fetch/post-comment); `mix symphony.dispatch` task. | done |
 | 1.5 | `Symphony.Runtime.Codex.AppServer` — minimal port of upstream's stdio JSON-RPC client (single-shot `run/4`); auto-approval policy; `Codex.Workspace.ensure!/2`. | done |
 | 2 | `Codex.AppServer.start/2` + `turn/4` + `stop/1` (broken out so port stays warm); `Codex.Session` GenServer (long-lived port + thread, cold-path seeding); `Codex.Supervisor` DynamicSupervisor + `Codex.Registry`; `Codex.Manager` find-or-spawn API; `IssueVO` `1..max_turns` loop with durable `conversation` state; per-turn Linear comment; mid-loop tracker re-fetch + terminal-state break; `Codex.Manager.stop_session/1` on terminal. | done |
-| 2.5 | Extract `RunAttemptWorkflow` (separate Workflow service type); pin workflow hash per attempt; make tracker comments idempotent; fix node-local workspace preflight; `Codex.Session` idle timeout; `linear_graphql` dynamic tool. | not started |
+| 2.5 | `IssueVO` slimmed to claim/dispatch (`claim_status`, `last_attempt_n`, `worker_node`); turn loop extracted into `RunAttemptWorkflow` (Workflow service keyed `${id}::a${n}`); WORKFLOW.md content read inside `ctx.run` so its bytes (and the SHA-256 hash) are pinned per attempt; `Workspace` split into `path_for/2` (journaled, inside `ctx.run`) + `preflight_local!/1` (outside, every replay) so cross-node resumes don't see a missing cwd; `Linear.post_comment_idempotent!/3` w/ deterministic `(identifier, attempt_n, turn_n)` marker; `Codex.Session` idle timeout w/ `Manager.run_turn` retry-on-noproc; `Codex.DynamicTool` registers `linear_graphql` on `thread/start` and dispatches `item/tool/call`. | done |
 | 3 | `Scheduler` VO (poll-tick); reconciliation across N issues (`Awaitable.all`); Codex turn awaitable/cancellable boundary; stall detection (`Awaitable.any`). | not started |
 | 4 | Phoenix LiveView dashboard; reads Restate admin API + journals. | not started |
 | 5 | Chaos hooks (kill codex / kill BEAM node / kill Restate node); demo-script E2E. | not started |
@@ -169,17 +169,34 @@ race rather than a comment around a blocking local call.
   exercise the REQUEST_RESPONSE-only path in `restate-elixir` v0.2.0. Slice 2
   builds run successfully but real long-turn smoke testing may force the v0.3
   work — flagged for the SDK side.
-- **Conversation state size.** Restate VO state has size limits; long-running
-  issues (20 turns × N kB each) may hit them. Slice 2 punts on compaction;
-  slice 3 may move the conversation to per-turn blobs / durable promises,
+- **Conversation state size.** Restate Workflow state has size limits; long-running
+  attempts (20 turns × N kB each) may hit them. Slice 2.5 keeps the conversation
+  in workflow state; slice 3 may move it to per-turn blobs / durable promises,
   summarize older turns, or store compressed refs instead of full text.
-- **`Codex.Session` idle timeout.** Sessions live until the issue terminates.
-  For polling demos with 100s of issues, this could exhaust file descriptors.
-  Slice 2.5 adds a timeout.
-- **Idempotent Linear writes.** `ctx.run` prevents replay after a committed run
-  result, but cannot prove Linear did not receive a comment when the response is
-  lost before journaling. Comments need deterministic markers and reconciliation.
-- **Workspace locality.** `Workspace.ensure!/2` currently runs inside `ctx.run`.
-  If the journaled workspace path was created on Node A and replay resumes on
-  Node B, the path is only valid when the workspace root is shared. Node-local
-  workspaces need an idempotent preflight outside the replayed value path.
+- **JSON-encodability of `ctx.run` results.** `restate-elixir` JSON-encodes the
+  result of every `ctx.run` block on first execution and JSON-decodes it on
+  replay. Tuples and structs without `Jason.Encoder` blow up at the propose step.
+  `RunAttemptWorkflow` returns plain string-keyed maps throughout; the legacy
+  `IssueVO` slice 2 code that returned `{config, tmpl}` tuples / `Issue` structs
+  from `ctx.run` was a latent bug — slice 2.5 routed around it by extracting
+  the loop into the workflow. Worth a follow-up audit on any remaining
+  `Linear.fetch_issue!`-inside-`ctx.run` calls.
+
+## Resolved in slice 2.5
+
+- ~~**`Codex.Session` idle timeout.**~~ Configurable via
+  `:codex_session_idle_timeout_ms` (default 5 min). Idle Sessions stop
+  cleanly; `Manager.run_turn` retries once on `:noproc` / `:normal` to
+  cover the race against an in-flight call. Cold-path seeding rebuilds
+  context from the workflow's durable `conversation`.
+- ~~**Idempotent Linear writes.**~~ `Linear.post_comment_idempotent!/3`
+  embeds a deterministic marker `(identifier, attempt_n, turn_n)` as an
+  HTML comment; on replay it searches the issue's comments first and
+  reuses the prior id if the marker is found.
+- ~~**Workspace locality.**~~ `Workspace.path_for/2` runs inside `ctx.run`
+  (pure, journal-safe); `Workspace.preflight_local!/1` runs outside on
+  every execution (incl. replays), so cross-node resumes always see the
+  cwd codex needs.
+- ~~**WORKFLOW.md hot-reload.**~~ Workflow content is read inside the
+  `RunAttemptWorkflow`'s first `ctx.run`, so its bytes are pinned per
+  attempt. Editing WORKFLOW.md affects new attempts only.

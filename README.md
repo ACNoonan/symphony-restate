@@ -2,7 +2,7 @@
 
 OpenAI [Symphony](https://github.com/openai/symphony) on Restate — a durable substrate for the spec.
 
-> **Status: pre-alpha, slice 2 done (2026-05-05).** Pivoted 2026-05-05. Built on
+> **Status: pre-alpha, slice 2.5 done (2026-05-05).** Pivoted 2026-05-05. Built on
 > [`restate-elixir`](https://github.com/ACNoonan/restate-elixir) v0.2.0 (local path-dep
 > until Hex-published). Implements Symphony's `SPEC.md` external contract; internal
 > architecture is Restate-native. See `docs/architecture.md`.
@@ -28,33 +28,42 @@ survive node death.
 ## Architecture (one paragraph)
 
 External contract = `SPEC.md`. Internal architecture = Restate-native, with BEAM/OTP
-and Restate as co-stars. Each Linear issue maps to a Restate **Virtual Object** that
-holds the durable claim state and turn-by-turn `conversation` journal (single-writer
-per issue ID). Slice 2 runs the `1..max_turns` loop inside `IssueVO.dispatch`, with
-each codex turn + Linear comment journaled via `ctx.run`; slice 2.5 extracts it into
-a separate `RunAttemptWorkflow`. The codex stdio session itself is owned by an
-**OTP-supervised `Codex.Session` GenServer** pinned to one BEAM node via Registry —
-fast turn-to-turn handoff while the node is healthy. On node death, Restate retries
-the invocation on a different node; `Codex.Manager` there spawns a fresh `Session`,
-whose cold-path seeding rebuilds codex's thread context from the durable
-`conversation` state in one extra round-trip. Both substrates do what they're best at.
+and Restate as co-stars. Each Linear issue maps to a Restate **Virtual Object**
+(`IssueVO`) that owns the *claim* (single-writer per issue ID). The actual `1..max_turns`
+turn loop lives in a separate **Workflow** service (`RunAttemptWorkflow`), keyed by
+`"\#{identifier}::a\#{attempt_n}"` — one workflow journal per attempt, holding the
+pinned WORKFLOW.md content hash, the `conversation`, and per-turn comment ids.
+`IssueVO.dispatch` synchronously calls into the workflow via `ctx.call`, so a
+failover of either VO or workflow resumes from the journal it owns. The codex stdio
+session itself is owned by an **OTP-supervised `Codex.Session` GenServer** pinned to
+one BEAM node via Registry — fast turn-to-turn handoff while the node is healthy.
+On node death, Restate retries the invocation on a different node; `Codex.Manager`
+there spawns a fresh `Session`, whose cold-path seeding rebuilds codex's thread
+context from the durable `conversation` state in one extra round-trip. Per-turn Linear
+comments are idempotent via deterministic markers `(identifier, attempt_n, turn_n)` —
+a replayed `ctx.run` after a lost response cannot duplicate them. The codex thread is
+given a `linear_graphql` dynamic tool so the agent can read and write its own ticket.
+Both substrates do what they're best at.
 
 See `docs/architecture.md` for diagrams + the full mapping against `SPEC.md`.
 
 ## Restate primitives shown
 
-Shipped in slice 2:
+Shipped through slice 2.5:
 
-- **Virtual Object** state (per-issue claim status, durable `conversation`,
-  `turn_count`, `last_comment_id`; `worker_node` is persisted for observability
-  only, never read for routing)
-- `ctx.run` for journaled side effects (workspace ensure, Linear fetch/comment,
-  codex turn I/O, prompt render)
-- `ctx.set_state` for the per-turn append to `conversation`
+- **Virtual Object** state on `IssueVO` (per-issue `claim_status`, `last_attempt_n`,
+  `last_attempt_result`; `worker_node` is persisted for observability only, never
+  read for routing)
+- **Workflow** state on `RunAttemptWorkflow` (per-attempt `workflow_content_hash`,
+  `workspace_path`, durable `conversation`, `turn_count`, `last_comment_id`)
+- `ctx.call` from `IssueVO` into `RunAttemptWorkflow` (durable cross-service call;
+  retries journaled, terminal failures propagate)
+- `ctx.run` for journaled side effects (WORKFLOW.md load + content-hash pin,
+  Linear fetch / idempotent comment, codex turn I/O, prompt render)
+- `ctx.set_state` for the per-turn `conversation` append
 
 Planned in later slices:
 
-- **Workflow** + durable promises (per-run-attempt, turn boundaries) — slice 2.5
 - `ctx.sleep` + scheduled invocations (poll loop, retry backoff, stall detection) — slice 3
 - `Awaitable.any` / `all` (turn-vs-stall race, fan-out reconciliation) — slice 3
 - Cancellation (terminal-state issue → cancel running run) — slice 3
@@ -104,7 +113,7 @@ durable `conversation` via cold-path seeding.
 | 1 | WORKFLOW.md parser + Liquid render in `:symphony_core`; `IssueVO.dispatch` w/ Linear fetch + post-comment + stub codex turn; `mix symphony.dispatch` task; endpoint registered on :9082 | **done (2026-05-05)** |
 | 1.5 | Real `codex app-server` stdio session (single-shot port of upstream `SymphonyElixir.Codex.AppServer`); per-turn workspace ensure; auto-approval policy for non-interactive runs | **done (2026-05-05)** |
 | 2 | `1..max_turns` continuation loop in `IssueVO`; per-issue `Codex.Session` GenServer pinned to one BEAM node via Registry + DynamicSupervisor; cold-path conversation seeding rebuilds codex thread on cross-node failover from durable `conversation` state; per-turn Linear comments + tracker re-fetch between turns | **done (2026-05-05)** |
-| 2.5 | Extract `RunAttemptWorkflow` (separate Restate Workflow service); idle-timeout for `Codex.Session`; `linear_graphql` dynamic tool so the agent can drive its own ticket | not started |
+| 2.5 | `IssueVO` slimmed to claim/dispatch; turn loop extracted into `RunAttemptWorkflow` (Workflow service, keyed `${id}::a${n}`); WORKFLOW.md content-hash pinned per attempt; node-local workspace preflight outside `ctx.run`; idempotent Linear comments via `(identifier, attempt_n, turn_n)` markers; idle-timeout for `Codex.Session`; `linear_graphql` dynamic tool so the agent can drive its own ticket | **done (2026-05-05)** |
 | 3 | Scheduler / poll loop; reconciliation; stall detection | not started |
 | 4 | Phoenix LiveView dashboard reading Restate journal | not started |
 | 5 | Chaos beats (`pkill` codex / BEAM node / Restate node) | not started |
