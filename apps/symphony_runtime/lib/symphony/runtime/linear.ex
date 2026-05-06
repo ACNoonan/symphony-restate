@@ -75,6 +75,65 @@ defmodule Symphony.Runtime.Linear do
   }
   """
 
+  @list_issues_in_project_query """
+  query SymphonyListIssuesInProject($slug: String!, $first: Int!) {
+    project(id: $slug) {
+      id
+      slugId
+      issues(first: $first) {
+        nodes {
+          id
+          identifier
+          title
+          state { name }
+          updatedAt
+        }
+      }
+    }
+  }
+  """
+
+  @doc """
+  List issues in the given Linear project, optionally filtered by
+  state name. Returns a list of `%{"id", "identifier", "title",
+  "state", "updated_at"}` maps (string keys, JSON-safe — meant to
+  be returned from inside `ctx.run`).
+
+  `active_states` is a list of allowed state names (case-insensitive
+  match). `nil` means "all states".
+
+  Used by `SchedulerVO.tick/2` to drive the poll loop. Raises on
+  GraphQL errors so the surrounding `ctx.run` records the failure.
+  """
+  @spec list_issues_in_project!(String.t(), [String.t()] | nil, pos_integer()) :: [map()]
+  def list_issues_in_project!(project_slug, active_states \\ nil, first \\ 100)
+      when is_binary(project_slug) and is_integer(first) and first > 0 do
+    case graphql!(@list_issues_in_project_query, %{"slug" => project_slug, "first" => first}) do
+      %{"data" => %{"project" => nil}} ->
+        raise "linear_project_not_found: #{project_slug}"
+
+      %{"data" => %{"project" => %{"issues" => %{"nodes" => nodes}}}} when is_list(nodes) ->
+        nodes
+        |> Enum.map(fn n ->
+          %{
+            "id" => n["id"],
+            "identifier" => n["identifier"],
+            "title" => n["title"],
+            "state" => get_in(n, ["state", "name"]),
+            "updated_at" => n["updatedAt"]
+          }
+        end)
+        |> filter_by_states(active_states)
+    end
+  end
+
+  defp filter_by_states(issues, nil), do: issues
+
+  defp filter_by_states(issues, states) when is_list(states) do
+    allowed = MapSet.new(states, &String.downcase/1)
+    Enum.filter(issues, fn %{"state" => s} -> is_binary(s) and MapSet.member?(allowed, String.downcase(s)) end)
+  end
+
   @doc "Look up one issue by identifier (e.g. `\"SYM-1\"`). Raises on failure."
   @spec fetch_issue!(String.t()) :: Issue.t()
   def fetch_issue!(identifier) when is_binary(identifier) do
