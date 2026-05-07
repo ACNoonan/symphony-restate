@@ -81,15 +81,7 @@ defmodule Symphony.Runtime.CodexTurnService do
     Context.run(ctx, fn ->
       issue_meta = atomize_issue_meta(issue_meta_in)
       codex_opts = decode_codex_opts(codex_opts_in)
-
-      conversation_for_session =
-        Enum.map(conversation_so_far, fn rec ->
-          %{
-            turn: rec["turn"],
-            prompt: rec["prompt"],
-            response: rec["response"]
-          }
-        end)
+      conversation_for_session = decode_conversation(conversation_so_far)
 
       case Manager.run_turn(
              identifier,
@@ -129,21 +121,23 @@ defmodule Symphony.Runtime.CodexTurnService do
     end
   end
 
+  @doc false
   # `issue_meta` flows in as a JSON-decoded map (string keys); the
   # AppServer's `turn/start` builds `title` from the identifier and
   # title fields, accepting both atom- and string-keyed input.
-  defp atomize_issue_meta(meta) when is_map(meta) do
+  def atomize_issue_meta(meta) when is_map(meta) do
     %{
       identifier: meta["identifier"] || meta[:identifier],
       title: meta["title"] || meta[:title] || ""
     }
   end
 
+  @doc false
   # `codex_opts` flows in as a JSON-decoded *object* (string keys),
   # but `AppServer.turn/4` and `Manager.run_turn/6` expect a Keyword
   # list with atom keys. Convert known keys here; ignore unknowns.
   @known_codex_opts ~w(codex_command approval_policy thread_sandbox turn_sandbox_policy turn_timeout_ms read_timeout_ms idle_timeout_ms)a
-  defp decode_codex_opts(opts) when is_map(opts) do
+  def decode_codex_opts(opts) when is_map(opts) do
     Enum.flat_map(@known_codex_opts, fn key ->
       case Map.get(opts, Atom.to_string(key)) do
         nil -> []
@@ -152,5 +146,22 @@ defmodule Symphony.Runtime.CodexTurnService do
     end)
   end
 
-  defp decode_codex_opts(_), do: []
+  def decode_codex_opts(_), do: []
+
+  @doc false
+  # `conversation_so_far` flows in as a list of string-keyed maps
+  # (JSON-decoded); `Codex.Session.run_turn/2` expects atom-keyed
+  # turn records. Convert per-record so cold-path seeding sees the
+  # right shape.
+  def decode_conversation(list) when is_list(list) do
+    Enum.map(list, fn rec ->
+      %{
+        turn: rec["turn"],
+        prompt: rec["prompt"],
+        response: rec["response"]
+      }
+    end)
+  end
+
+  def decode_conversation(_), do: []
 end

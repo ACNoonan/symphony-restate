@@ -210,9 +210,10 @@ defmodule Symphony.Runtime.Codex.Session do
 
   # ---------------------- Helpers ----------------------
 
-  defp format_with_preamble([], prompt), do: prompt
+  @doc false
+  def format_with_preamble([], prompt), do: prompt
 
-  defp format_with_preamble(missing_turns, prompt) do
+  def format_with_preamble(missing_turns, prompt) do
     history =
       missing_turns
       |> Enum.map_join("\n\n", fn %{turn: n, prompt: p, response: r} ->
