@@ -51,20 +51,22 @@ defmodule Symphony.Runtime.RunAttemptWorkflow do
     * `"turn_count"` — most recent turn number completed
     * `"last_comment_id"` — Linear comment id from the most
       recent turn
-    * `"current_cancel_awakeable_id"` — opaque awakeable id for
-      the in-flight turn's cancel slot. Written on every turn
-      entry; read by the `cancel/2` shared handler so an operator
-      cancel completes the awakeable, which makes the per-turn
-      `Awaitable.any` race wake on the cancel branch. Stale
-      between turns (the next turn allocates a fresh awakeable,
-      orphaning the old one — the orphan is never awaited so a
-      late completion is a no-op).
-    * `"current_nudge_now_awakeable_id"` — companion awakeable for
-      `nudge_now/2`. Same lifecycle as the cancel awakeable but
-      its branch in the race aborts the in-flight turn *and
-      continues the loop* with the operator's text already staged
-      in `nudge:*` state — the next turn renders it as the next
-      operator interjection.
+    * `"current_turn_invocation_id"` — Restate invocation id of
+      the in-flight `CodexTurnService` call, captured via
+      `Restate.Awaitable.invocation_id/2` after `call_async`. Read
+      by the `cancel/2` shared handler, which calls
+      `Restate.Context.cancel_invocation/2` directly — the SDK
+      cascades the cancel signal through the call tree, the
+      workflow's `Awaitable.any` resolves with a 409, and the
+      rescue branch maps that to `claim_status="cancelled"`.
+      Cleared at turn boundary so a late operator click can't
+      cancel the wrong invocation.
+    * `"current_nudge_now_awakeable_id"` — awakeable id for the
+      in-flight turn's nudge_now slot. Written on every turn
+      entry; the `nudge_now/2` shared handler completes it to
+      wake the per-turn race on the nudge branch (the operator's
+      text is staged separately in `nudge:*` state, not in the
+      awakeable value).
 
   ## Input / output
 
@@ -215,19 +217,28 @@ defmodule Symphony.Runtime.RunAttemptWorkflow do
 
   @doc """
   Shared handler. Operator-initiated cancel for the active turn of
-  this attempt. Reads the active turn's awakeable id from workflow
-  state and completes it with a cancel sentinel; the workflow's
-  `Awaitable.any` race wakes on the cancel branch and unwinds.
+  this attempt. Reads the in-flight turn's Restate invocation id
+  from workflow state and calls `Restate.Context.cancel_invocation/2`
+  on it — the SDK cascades the cancel signal through the call tree,
+  the workflow's per-turn `Awaitable.any` resolves with a 409, and
+  the rescue branch maps to `claim_status="cancelled"`.
 
   Returns `%{"ok" => true}` if a cancel was dispatched, or
   `%{"ok" => false, "reason" => ...}` if no active turn was
-  cancellable.
+  cancellable. Brief race window between `call_async` and
+  `Awaitable.invocation_id/2` returning where the state slot is
+  unset — operator can retry.
   """
   def cancel(%Context{} = ctx, _input) do
-    case Context.get_state(ctx, "current_cancel_awakeable_id") do
+    case Context.get_state(ctx, "current_turn_invocation_id") do
       id when is_binary(id) and id != "" ->
-        Context.complete_awakeable(ctx, id, "cancelled_by_operator")
-        %{"ok" => true, "workflow_key" => Context.key(ctx)}
+        Context.cancel_invocation(ctx, id)
+
+        %{
+          "ok" => true,
+          "target_invocation_id" => id,
+          "workflow_key" => Context.key(ctx)
+        }
 
       _ ->
         %{
@@ -442,10 +453,12 @@ defmodule Symphony.Runtime.RunAttemptWorkflow do
     end
   end
 
-  # Four-way race: codex turn vs stall timer vs operator cancel vs
-  # operator nudge_now. Cancel and nudge_now both publish awakeable
-  # ids to workflow state so shared handlers can complete them from
-  # outside the running workflow.
+  # Three-way race: codex turn vs stall timer vs operator nudge_now.
+  # Cancel is OFF the race — it arrives via the SDK's cancel cascade:
+  # `cancel/2` calls `Context.cancel_invocation/2` against the turn's
+  # invocation id, the SDK propagates the signal to the callee, and
+  # the await on `turn_handle` resolves with a 409 TerminalError
+  # which the rescue catches.
   #
   # Returns:
   #   * `text :: String.t()` — turn completed normally.
@@ -455,7 +468,7 @@ defmodule Symphony.Runtime.RunAttemptWorkflow do
   #
   # Raises terminal:
   #   * stall   → `codex_turn_stall`
-  #   * cancel  → `cancelled_by_operator`
+  #   * cancel  → `cancelled_by_operator` (mapped from cascade 409)
   #
   # Restate's CANCEL signal can't preempt code already executing
   # inside `ctx.run` (the model's tool-call loop runs to its own
@@ -487,19 +500,50 @@ defmodule Symphony.Runtime.RunAttemptWorkflow do
       "codex_opts" => keyword_to_string_map(codex_opts)
     }
 
-    {cancel_id, cancel_handle} = Context.awakeable(ctx)
+    turn_handle = Context.call_async(ctx, @codex_turn_service, @codex_turn_handler, payload)
+
+    # Capture the turn's invocation id so the `cancel/2` shared
+    # handler can target it via `Context.cancel_invocation/2`. One
+    # round-trip on first execution; cached on replay.
+    turn_invocation_id = Awaitable.invocation_id(ctx, turn_handle)
+    Context.set_state(ctx, "current_turn_invocation_id", turn_invocation_id)
+
     {nudge_now_id, nudge_now_handle} = Context.awakeable(ctx)
-    Context.set_state(ctx, "current_cancel_awakeable_id", cancel_id)
     Context.set_state(ctx, "current_nudge_now_awakeable_id", nudge_now_id)
 
-    turn_handle = Context.call_async(ctx, @codex_turn_service, @codex_turn_handler, payload)
     stall_handle = Context.timer(ctx, stall_timeout_ms)
 
-    case Awaitable.any(ctx, [turn_handle, stall_handle, cancel_handle, nudge_now_handle]) do
+    result =
+      try do
+        Awaitable.any(ctx, [turn_handle, stall_handle, nudge_now_handle])
+      rescue
+        e in Restate.TerminalError ->
+          if e.code == 409 do
+            # Cancel cascade: operator hit `cancel`, SDK signalled the
+            # callee, the await raises 409. Kill the port so any
+            # in-flight `ctx.run` inside CodexTurnService unwinds
+            # promptly, then re-raise as our standard cancelled-by-
+            # operator terminal so dispatch's rescue maps to
+            # claim_status="cancelled".
+            Context.run(ctx, fn ->
+              Manager.stop_session(identifier)
+              :ok
+            end)
+
+            Context.clear_state(ctx, "current_turn_invocation_id")
+            terminal!("cancelled_by_operator", %{turn_n: nil})
+          else
+            reraise e, __STACKTRACE__
+          end
+      end
+
+    case result do
       {0, %{"text" => text}} when is_binary(text) and text != "" ->
+        Context.clear_state(ctx, "current_turn_invocation_id")
         text
 
       {0, %{"text" => ""}} ->
+        Context.clear_state(ctx, "current_turn_invocation_id")
         "[symphony-restate] codex turn completed without an extractable agent message; check the Restate journal for raw events."
 
       {0, other} ->
@@ -517,18 +561,6 @@ defmodule Symphony.Runtime.RunAttemptWorkflow do
         terminal!("codex_turn_stall", %{stall_timeout_ms: stall_timeout_ms})
 
       {2, _value} ->
-        # Operator cancel fired via `cancel/2`. Kill the port to
-        # break the in-flight `ctx.run` halfway and let resources
-        # release; raise terminal so `IssueVO.dispatch` records a
-        # cancel-typed claim status.
-        Context.run(ctx, fn ->
-          Manager.stop_session(identifier)
-          :ok
-        end)
-
-        terminal!("cancelled_by_operator", %{turn_n: nil})
-
-      {3, _value} ->
         # Operator nudge_now fired via `nudge_now/2`. Kill the port
         # so the abandoned turn's resources release; signal the
         # caller to continue the loop. The operator's text is
@@ -541,6 +573,7 @@ defmodule Symphony.Runtime.RunAttemptWorkflow do
           :ok
         end)
 
+        Context.clear_state(ctx, "current_turn_invocation_id")
         {:redirect, "nudge_now"}
     end
   end

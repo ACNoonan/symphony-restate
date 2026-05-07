@@ -266,6 +266,8 @@ defmodule Symphony.Runtime.IssueVO do
     }
   end
 
+  defp terminal_claim_status(%Restate.TerminalError{code: 409}), do: "cancelled"
+
   defp terminal_claim_status(%Restate.TerminalError{message: msg}) when is_binary(msg) do
     if String.contains?(msg, "cancelled_by_operator"), do: "cancelled", else: "failed"
   end
