@@ -16,7 +16,7 @@ defmodule Symphony.Runtime.Codex.Manager do
   conversation state.
   """
 
-  alias Symphony.Runtime.Codex.{Session, Supervisor, Registry}
+  alias Symphony.Runtime.Codex.{IssueSupervisor, Session, Supervisor, Registry}
 
   @type turn_record :: Session.turn_record()
 
@@ -74,23 +74,29 @@ defmodule Symphony.Runtime.Codex.Manager do
         {:ok, pid}
 
       [] ->
-        spec = {Session, [
-          name: Session.via(identifier),
-          workspace: workspace,
-          app_server_opts: opts
-        ]}
+        spec = {IssueSupervisor,
+                [identifier: identifier, workspace: workspace, app_server_opts: opts]}
 
         case Elixir.DynamicSupervisor.start_child(Supervisor, spec) do
-          {:ok, pid} ->
-            {:ok, pid}
+          {:ok, _sup_pid} ->
+            lookup_session_pid(identifier)
 
-          {:error, {:already_started, pid}} ->
-            # Race between two callers. Either pid works.
-            {:ok, pid}
+          {:error, {:already_started, _sup_pid}} ->
+            # Race between two callers; the other one already spawned
+            # the pair. The Session under it is registered with the
+            # same identifier key, so the lookup wins regardless.
+            lookup_session_pid(identifier)
 
           {:error, _} = err ->
             err
         end
+    end
+  end
+
+  defp lookup_session_pid(identifier) do
+    case Elixir.Registry.lookup(Registry, identifier) do
+      [{pid, _}] -> {:ok, pid}
+      [] -> {:error, :session_not_registered}
     end
   end
 end

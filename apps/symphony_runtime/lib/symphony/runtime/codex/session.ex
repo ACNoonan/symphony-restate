@@ -87,9 +87,13 @@ defmodule Symphony.Runtime.Codex.Session do
 
   @impl true
   def init(opts) do
+    identifier = Keyword.fetch!(opts, :identifier)
     workspace = Keyword.fetch!(opts, :workspace)
-    app_server_opts = Keyword.get(opts, :app_server_opts, [])
+    base_app_server_opts = Keyword.get(opts, :app_server_opts, [])
     idle_timeout_ms = Keyword.get(opts, :idle_timeout_ms, default_idle_timeout_ms())
+
+    on_event = build_broadcast_hook(identifier)
+    app_server_opts = Keyword.put(base_app_server_opts, :on_event, on_event)
 
     case AppServer.start(workspace, app_server_opts) do
       {:ok, session} ->
@@ -97,6 +101,7 @@ defmodule Symphony.Runtime.Codex.Session do
         Process.flag(:trap_exit, true)
 
         state = %{
+          identifier: identifier,
           session: session,
           completed_turns: 0,
           app_server_opts: app_server_opts,
@@ -108,6 +113,27 @@ defmodule Symphony.Runtime.Codex.Session do
       {:error, reason} ->
         Logger.error(fn -> "codex session start failed: #{inspect(reason)}" end)
         {:stop, {:codex_start_failed, reason}}
+    end
+  end
+
+  # Closure captures only the identifier so it's tiny and replay-safe
+  # across the GenServer lifecycle. Phoenix.PubSub.broadcast is
+  # best-effort: if Symphony.Runtime.PubSub isn't running (e.g. during
+  # standalone runtime tests), the broadcast errors and we swallow it
+  # — the agent stream is observability, not load-bearing.
+  defp build_broadcast_hook(identifier) do
+    topic = "agent:" <> identifier
+
+    fn payload ->
+      try do
+        Phoenix.PubSub.broadcast(
+          Symphony.Runtime.PubSub,
+          topic,
+          {:agent_event, identifier, payload}
+        )
+      rescue
+        _ -> :ok
+      end
     end
   end
 

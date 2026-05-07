@@ -51,6 +51,20 @@ defmodule Symphony.Runtime.RunAttemptWorkflow do
     * `"turn_count"` — most recent turn number completed
     * `"last_comment_id"` — Linear comment id from the most
       recent turn
+    * `"current_cancel_awakeable_id"` — opaque awakeable id for
+      the in-flight turn's cancel slot. Written on every turn
+      entry; read by the `cancel/2` shared handler so an operator
+      cancel completes the awakeable, which makes the per-turn
+      `Awaitable.any` race wake on the cancel branch. Stale
+      between turns (the next turn allocates a fresh awakeable,
+      orphaning the old one — the orphan is never awaited so a
+      late completion is a no-op).
+    * `"current_nudge_now_awakeable_id"` — companion awakeable for
+      `nudge_now/2`. Same lifecycle as the cancel awakeable but
+      its branch in the race aborts the in-flight turn *and
+      continues the loop* with the operator's text already staged
+      in `nudge:*` state — the next turn renders it as the next
+      operator interjection.
 
   ## Input / output
 
@@ -89,6 +103,7 @@ defmodule Symphony.Runtime.RunAttemptWorkflow do
   @default_stall_timeout_ms :timer.minutes(5)
   @codex_turn_service "CodexTurnService"
   @codex_turn_handler "run"
+  @nudge_state_prefix "nudge:"
 
   @doc """
   Shared handler. Returns a snapshot of this attempt's workflow
@@ -106,6 +121,121 @@ defmodule Symphony.Runtime.RunAttemptWorkflow do
       "turn_count" => Context.get_state(ctx, "turn_count"),
       "last_comment_id" => Context.get_state(ctx, "last_comment_id")
     }
+  end
+
+  @doc """
+  Shared handler. Operator interjection for the next turn of this
+  attempt. Stores the message under a unique key so concurrent
+  nudges don't race on the same state slot. The `run` handler
+  drains all `nudge:*` keys at the top of each turn (after a
+  suspending op so the state snapshot is fresh) and prepends them
+  to the rendered prompt as `### Operator interjection`.
+
+  Latency: turn-boundary. A nudge sent mid-turn is observed at the
+  next turn's prompt render. For sub-second mid-turn injection see
+  `nudge_now/2` (slice 5 / phase D).
+  """
+  def nudge(%Context{} = ctx, %{"text" => text}) when is_binary(text) and text != "" do
+    key = nudge_state_key()
+
+    Context.set_state(ctx, key, %{
+      "text" => text,
+      "received_at_ms" => System.os_time(:millisecond)
+    })
+
+    %{"ok" => true, "key" => key, "workflow_key" => Context.key(ctx)}
+  end
+
+  def nudge(%Context{} = ctx, _other) do
+    %{
+      "ok" => false,
+      "reason" => "missing_or_empty_text",
+      "workflow_key" => Context.key(ctx)
+    }
+  end
+
+  defp nudge_state_key do
+    ms = System.os_time(:millisecond)
+    nonce = :rand.uniform(1_000_000)
+    padded_ms = ms |> Integer.to_string() |> String.pad_leading(16, "0")
+    @nudge_state_prefix <> padded_ms <> ":" <> Integer.to_string(nonce)
+  end
+
+  @doc """
+  Shared handler. Mid-turn operator interjection — stages the text
+  for the next turn (same as `nudge/2`) AND completes the active
+  turn's `nudge_now` awakeable so the per-turn `Awaitable.any` race
+  wakes immediately, abandons the in-flight turn, kills the local
+  Codex.Session port, and continues the loop with the staged text.
+
+  If no turn is currently in flight (the workflow is between turns
+  or hasn't reached the first turn yet) the message is still staged;
+  the next turn will pick it up. The response includes
+  `"queued_only" => true` in that case so the operator UI can show
+  "queued" rather than "interrupted now".
+  """
+  def nudge_now(%Context{} = ctx, %{"text" => text}) when is_binary(text) and text != "" do
+    key = nudge_state_key()
+
+    Context.set_state(ctx, key, %{
+      "text" => text,
+      "received_at_ms" => System.os_time(:millisecond),
+      "via" => "nudge_now"
+    })
+
+    case Context.get_state(ctx, "current_nudge_now_awakeable_id") do
+      id when is_binary(id) and id != "" ->
+        Context.complete_awakeable(ctx, id, "nudge_now_redirect")
+
+        %{
+          "ok" => true,
+          "interrupted" => true,
+          "key" => key,
+          "workflow_key" => Context.key(ctx)
+        }
+
+      _ ->
+        %{
+          "ok" => true,
+          "interrupted" => false,
+          "queued_only" => true,
+          "key" => key,
+          "workflow_key" => Context.key(ctx)
+        }
+    end
+  end
+
+  def nudge_now(%Context{} = ctx, _other) do
+    %{
+      "ok" => false,
+      "reason" => "missing_or_empty_text",
+      "workflow_key" => Context.key(ctx)
+    }
+  end
+
+  @doc """
+  Shared handler. Operator-initiated cancel for the active turn of
+  this attempt. Reads the active turn's awakeable id from workflow
+  state and completes it with a cancel sentinel; the workflow's
+  `Awaitable.any` race wakes on the cancel branch and unwinds.
+
+  Returns `%{"ok" => true}` if a cancel was dispatched, or
+  `%{"ok" => false, "reason" => ...}` if no active turn was
+  cancellable.
+  """
+  def cancel(%Context{} = ctx, _input) do
+    case Context.get_state(ctx, "current_cancel_awakeable_id") do
+      id when is_binary(id) and id != "" ->
+        Context.complete_awakeable(ctx, id, "cancelled_by_operator")
+        %{"ok" => true, "workflow_key" => Context.key(ctx)}
+
+      _ ->
+        %{
+          "ok" => false,
+          "reason" => "no_active_turn",
+          "workflow_key" => Context.key(ctx)
+        }
+    end
   end
 
   @doc "Workflow `run` handler. One-shot per workflow key."
@@ -220,93 +350,122 @@ defmodule Symphony.Runtime.RunAttemptWorkflow do
 
     attempt_label = if turn_n == 1, do: nil, else: turn_n
 
+    nudges = drain_pending_nudges(ctx)
+
     prompt =
       Context.run(ctx, fn ->
         case Prompt.render(prompt_template, %{issue: acc["issue"], attempt: attempt_label}) do
-          {:ok, p} -> p
+          {:ok, p} -> prepend_operator_nudges(p, nudges)
           {:error, reason} -> terminal!("prompt_render_failed", reason)
         end
       end)
 
-    response =
-      run_turn_with_stall_detection(
-        ctx,
-        identifier,
-        workspace_path,
-        prompt,
-        acc["conversation"],
-        acc["issue"],
-        codex_opts,
-        stall_timeout_ms
-      )
+    case run_turn_with_races(
+           ctx,
+           identifier,
+           workspace_path,
+           prompt,
+           acc["conversation"],
+           acc["issue"],
+           codex_opts,
+           stall_timeout_ms
+         ) do
+      {:redirect, _reason} ->
+        # nudge_now aborted this turn; the operator's text is
+        # already staged in `nudge:*` state for the next turn's
+        # drain. Don't append a turn record and don't post a
+        # Linear comment for the abandoned turn. Continue the
+        # loop unless we've hit max_turns.
+        cond do
+          turn_n >= max_turns ->
+            {:halt,
+             %{
+               "ok" => true,
+               "identifier" => identifier,
+               "attempt_n" => attempt_n,
+               "issue_id" => acc["issue"]["id"],
+               "turns" => turn_n,
+               "ended_by" => "max_turns_via_nudge_now"
+             }}
 
-    new_record = %{"turn" => turn_n, "prompt" => prompt, "response" => response}
-    new_conversation = acc["conversation"] ++ [new_record]
+          true ->
+            refreshed = fetch_issue(ctx, identifier)
+            {:cont, %{"issue" => refreshed, "conversation" => acc["conversation"]}}
+        end
 
-    comment_id =
-      Context.run(ctx, fn ->
-        marker = Linear.attempt_turn_marker(identifier, attempt_n, turn_n)
-        body = format_turn_comment(turn_n, max_turns, response, marker)
+      response when is_binary(response) ->
+        new_record = %{"turn" => turn_n, "prompt" => prompt, "response" => response}
+        new_conversation = acc["conversation"] ++ [new_record]
 
-        Linear.post_comment_idempotent!(acc["issue"]["id"], body, marker)
-      end)
+        comment_id =
+          Context.run(ctx, fn ->
+            marker = Linear.attempt_turn_marker(identifier, attempt_n, turn_n)
+            body = format_turn_comment(turn_n, max_turns, response, marker)
 
-    Context.set_state(ctx, "conversation", new_conversation)
-    Context.set_state(ctx, "turn_count", turn_n)
-    Context.set_state(ctx, "last_comment_id", comment_id)
+            Linear.post_comment_idempotent!(acc["issue"]["id"], body, marker)
+          end)
 
-    cond do
-      turn_n >= max_turns ->
-        {:halt,
-         %{
-           "ok" => true,
-           "identifier" => identifier,
-           "attempt_n" => attempt_n,
-           "issue_id" => acc["issue"]["id"],
-           "turns" => turn_n,
-           "ended_by" => "max_turns"
-         }}
+        Context.set_state(ctx, "conversation", new_conversation)
+        Context.set_state(ctx, "turn_count", turn_n)
+        Context.set_state(ctx, "last_comment_id", comment_id)
 
-      true ->
-        refreshed = fetch_issue(ctx, identifier)
+        cond do
+          turn_n >= max_turns ->
+            {:halt,
+             %{
+               "ok" => true,
+               "identifier" => identifier,
+               "attempt_n" => attempt_n,
+               "issue_id" => acc["issue"]["id"],
+               "turns" => turn_n,
+               "ended_by" => "max_turns"
+             }}
 
-        if String.downcase(refreshed["state"] || "") in terminal_states do
-          {:halt,
-           %{
-             "ok" => true,
-             "identifier" => identifier,
-             "attempt_n" => attempt_n,
-             "issue_id" => acc["issue"]["id"],
-             "turns" => turn_n,
-             "ended_by" => "tracker_terminal",
-             "final_state" => refreshed["state"]
-           }}
-        else
-          {:cont, %{"issue" => refreshed, "conversation" => new_conversation}}
+          true ->
+            refreshed = fetch_issue(ctx, identifier)
+
+            if String.downcase(refreshed["state"] || "") in terminal_states do
+              {:halt,
+               %{
+                 "ok" => true,
+                 "identifier" => identifier,
+                 "attempt_n" => attempt_n,
+                 "issue_id" => acc["issue"]["id"],
+                 "turns" => turn_n,
+                 "ended_by" => "tracker_terminal",
+                 "final_state" => refreshed["state"]
+               }}
+            else
+              {:cont, %{"issue" => refreshed, "conversation" => new_conversation}}
+            end
         end
     end
   end
 
-  # Race the codex turn (a `call_async` to `CodexTurnService`)
-  # against a `ctx.timer` stall timer via `Awaitable.any/2`.
+  # Four-way race: codex turn vs stall timer vs operator cancel vs
+  # operator nudge_now. Cancel and nudge_now both publish awakeable
+  # ids to workflow state so shared handlers can complete them from
+  # outside the running workflow.
   #
-  #   * Turn wins → return its text.
-  #   * Stall wins → kill the local Codex.Session port (so the
-  #     in-flight turn at the OTP layer abandons its work and the
-  #     port resources release) and raise a terminal failure for
-  #     the attempt.
+  # Returns:
+  #   * `text :: String.t()` — turn completed normally.
+  #   * `{:redirect, reason}` — nudge_now fired; turn abandoned, the
+  #     operator's text is already staged in `nudge:*` state, the
+  #     caller continues the loop without recording a turn.
+  #
+  # Raises terminal:
+  #   * stall   → `codex_turn_stall`
+  #   * cancel  → `cancelled_by_operator`
   #
   # Restate's CANCEL signal can't preempt code already executing
-  # inside the CodexTurnService's `ctx.run`. The port-kill is the
-  # OTP-side preemption that meets the cancel signal halfway:
-  # the Session's `handle_info({port, {:exit_status, _}}, ...)`
-  # stops the GenServer, the in-flight `Manager.run_turn` returns
-  # `{:error, {:port_exit, _}}` from `AppServer.turn`, and the
-  # CodexTurnService's `ctx.run` proposes that as a terminal
-  # failure on its own — at which point our `call_async` handle
-  # also resolves with the failure (already abandoned because we
-  # took the stall branch).
-  defp run_turn_with_stall_detection(
+  # inside `ctx.run` (the model's tool-call loop runs to its own
+  # completion). The port-kill is the OTP-side preemption that
+  # meets the operator's intent halfway: Session's
+  # `handle_info({port, {:exit_status, _}}, ...)` stops the
+  # GenServer, the in-flight `Manager.run_turn` returns
+  # `{:error, {:port_exit, _}}`, and the abandoned `CodexTurnService`
+  # invocation terminates on its own.
+  defp run_turn_with_races(
          ctx,
          identifier,
          workspace_path,
@@ -328,10 +487,15 @@ defmodule Symphony.Runtime.RunAttemptWorkflow do
       "codex_opts" => keyword_to_string_map(codex_opts)
     }
 
+    {cancel_id, cancel_handle} = Context.awakeable(ctx)
+    {nudge_now_id, nudge_now_handle} = Context.awakeable(ctx)
+    Context.set_state(ctx, "current_cancel_awakeable_id", cancel_id)
+    Context.set_state(ctx, "current_nudge_now_awakeable_id", nudge_now_id)
+
     turn_handle = Context.call_async(ctx, @codex_turn_service, @codex_turn_handler, payload)
     stall_handle = Context.timer(ctx, stall_timeout_ms)
 
-    case Awaitable.any(ctx, [turn_handle, stall_handle]) do
+    case Awaitable.any(ctx, [turn_handle, stall_handle, cancel_handle, nudge_now_handle]) do
       {0, %{"text" => text}} when is_binary(text) and text != "" ->
         text
 
@@ -344,14 +508,40 @@ defmodule Symphony.Runtime.RunAttemptWorkflow do
       {1, :ok} ->
         # Stall fired. Kill the port so the abandoned in-flight turn
         # releases its file descriptors instead of running to its
-        # own (long) timeout. Recorded inside `ctx.run` so the kill
-        # is journaled as part of the stall handling.
+        # own (long) timeout.
         Context.run(ctx, fn ->
           Manager.stop_session(identifier)
           :ok
         end)
 
         terminal!("codex_turn_stall", %{stall_timeout_ms: stall_timeout_ms})
+
+      {2, _value} ->
+        # Operator cancel fired via `cancel/2`. Kill the port to
+        # break the in-flight `ctx.run` halfway and let resources
+        # release; raise terminal so `IssueVO.dispatch` records a
+        # cancel-typed claim status.
+        Context.run(ctx, fn ->
+          Manager.stop_session(identifier)
+          :ok
+        end)
+
+        terminal!("cancelled_by_operator", %{turn_n: nil})
+
+      {3, _value} ->
+        # Operator nudge_now fired via `nudge_now/2`. Kill the port
+        # so the abandoned turn's resources release; signal the
+        # caller to continue the loop. The operator's text is
+        # already staged in `nudge:*` state (the `nudge_now/2`
+        # handler wrote it before completing the awakeable) so the
+        # next turn's drain picks it up as the next operator
+        # interjection.
+        Context.run(ctx, fn ->
+          Manager.stop_session(identifier)
+          :ok
+        end)
+
+        {:redirect, "nudge_now"}
     end
   end
 
@@ -362,6 +552,47 @@ defmodule Symphony.Runtime.RunAttemptWorkflow do
       code: 500,
       message: "#{label}: #{inspect(reason)}"
   end
+
+  # Read every `nudge:*` state key, decode its payload, and clear
+  # the slot. Sorted lexicographically — keys embed a left-padded
+  # millisecond timestamp so this yields the operator's chronological
+  # send order.
+  defp drain_pending_nudges(ctx) do
+    ctx
+    |> Context.state_keys()
+    |> Enum.filter(&String.starts_with?(&1, @nudge_state_prefix))
+    |> Enum.sort()
+    |> Enum.flat_map(fn key ->
+      payload = Context.get_state(ctx, key)
+      Context.clear_state(ctx, key)
+
+      case payload do
+        %{"text" => text} = nudge when is_binary(text) and text != "" -> [nudge]
+        _ -> []
+      end
+    end)
+  end
+
+  defp prepend_operator_nudges(prompt, []), do: prompt
+
+  defp prepend_operator_nudges(prompt, nudges) do
+    block =
+      Enum.map_join(nudges, "\n\n", fn n ->
+        ts = format_nudge_at(n["received_at_ms"])
+        "### Operator interjection (received #{ts}):\n#{n["text"]}"
+      end)
+
+    block <> "\n\n---\n\n" <> prompt
+  end
+
+  defp format_nudge_at(ms) when is_integer(ms) do
+    ms
+    |> DateTime.from_unix!(:millisecond)
+    |> DateTime.truncate(:second)
+    |> DateTime.to_iso8601()
+  end
+
+  defp format_nudge_at(_), do: "unknown time"
 
   defp terminal_states_from_config(config) do
     case get_in(config, ["tracker", "terminal_states"]) do

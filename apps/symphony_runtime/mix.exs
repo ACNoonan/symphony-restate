@@ -27,6 +27,7 @@ defmodule Symphony.Runtime.MixProject do
       {:symphony_core, in_umbrella: true},
       {:restate_server, path: "../../../restate-elixir/apps/restate_server"},
       {:restate_protocol, path: "../../../restate-elixir/apps/restate_protocol"},
+      {:phoenix_pubsub, "~> 2.1"},
       {:req, "~> 0.5"},
       {:jason, "~> 1.4"}
     ]

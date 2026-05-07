@@ -15,6 +15,7 @@ defmodule Symphony.Runtime.Application do
     end)
 
     children = [
+      {Phoenix.PubSub, name: Symphony.Runtime.PubSub},
       {Registry, keys: :unique, name: Symphony.Runtime.Codex.Registry},
       Symphony.Runtime.Codex.Supervisor
     ]
@@ -37,6 +38,21 @@ defmodule Symphony.Runtime.Application do
           name: "readState",
           type: :shared,
           mfa: {Symphony.Runtime.IssueVO, :read_state, 2}
+        },
+        %{
+          name: "cancel",
+          type: :shared,
+          mfa: {Symphony.Runtime.IssueVO, :cancel, 2}
+        },
+        %{
+          name: "nudge",
+          type: :shared,
+          mfa: {Symphony.Runtime.IssueVO, :nudge, 2}
+        },
+        %{
+          name: "nudgeNow",
+          type: :shared,
+          mfa: {Symphony.Runtime.IssueVO, :nudge_now, 2}
         }
       ]
     })
@@ -54,6 +70,21 @@ defmodule Symphony.Runtime.Application do
           name: "readState",
           type: :shared,
           mfa: {Symphony.Runtime.RunAttemptWorkflow, :read_state, 2}
+        },
+        %{
+          name: "cancel",
+          type: :shared,
+          mfa: {Symphony.Runtime.RunAttemptWorkflow, :cancel, 2}
+        },
+        %{
+          name: "nudge",
+          type: :shared,
+          mfa: {Symphony.Runtime.RunAttemptWorkflow, :nudge, 2}
+        },
+        %{
+          name: "nudgeNow",
+          type: :shared,
+          mfa: {Symphony.Runtime.RunAttemptWorkflow, :nudge_now, 2}
         }
       ]
     })

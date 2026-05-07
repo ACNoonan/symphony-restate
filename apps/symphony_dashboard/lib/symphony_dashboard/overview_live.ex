@@ -36,6 +36,9 @@ defmodule Symphony.Dashboard.OverviewLive do
   alias Symphony.Core.Workflow
   alias Symphony.Dashboard.RestateClient
 
+  @runtime_pubsub Symphony.Runtime.PubSub
+  @stream_cap 100
+
   @impl true
   def mount(params, _session, socket) do
     project_slug = params["project"] || project_slug_from_workflow()
@@ -49,6 +52,8 @@ defmodule Symphony.Dashboard.OverviewLive do
       |> assign(:interval_ms, interval_ms)
       |> assign(:expanded, MapSet.new())
       |> assign(:attempts, %{})
+      |> assign(:streams, %{})
+      |> assign(:nudge_drafts, %{})
       |> assign(:last_error, nil)
       |> assign(:last_refresh_at, nil)
       |> assign(:reconcile, %{"issues" => [], "ok" => false})
@@ -69,21 +74,117 @@ defmodule Symphony.Dashboard.OverviewLive do
     {:noreply, socket}
   end
 
+  def handle_info({:agent_event, identifier, payload}, socket) do
+    if MapSet.member?(socket.assigns.expanded, identifier) do
+      entry = %{
+        at: System.system_time(:millisecond),
+        method: Map.get(payload, "method"),
+        params: Map.get(payload, "params")
+      }
+
+      streams =
+        Map.update(socket.assigns.streams, identifier, [entry], fn buf ->
+          [entry | buf] |> Enum.take(@stream_cap)
+        end)
+
+      {:noreply, assign(socket, :streams, streams)}
+    else
+      {:noreply, socket}
+    end
+  end
+
   @impl true
+  def handle_event("cancel", %{"identifier" => identifier}, socket) do
+    case RestateClient.issue_cancel(identifier) do
+      {:ok, %{"ok" => true}} ->
+        {:noreply, socket |> refresh_reconcile() |> refresh_one_attempt(identifier)}
+
+      {:ok, %{"ok" => false} = resp} ->
+        {:noreply, assign(socket, :last_error, "cancel rejected: " <> inspect(resp))}
+
+      {:error, reason} ->
+        {:noreply, assign(socket, :last_error, "cancel failed: " <> format_error(reason))}
+    end
+  end
+
+  def handle_event("nudge_change", %{"identifier" => identifier, "text" => text}, socket) do
+    drafts = Map.put(socket.assigns.nudge_drafts, identifier, text)
+    {:noreply, assign(socket, :nudge_drafts, drafts)}
+  end
+
+  def handle_event(
+        "nudge_submit",
+        %{"identifier" => identifier, "text" => text, "action" => "now"},
+        socket
+      ) do
+    submit_nudge(socket, identifier, text, &RestateClient.issue_nudge_now/2, "nudge_now")
+  end
+
+  def handle_event("nudge_submit", %{"identifier" => identifier, "text" => text}, socket) do
+    submit_nudge(socket, identifier, text, &RestateClient.issue_nudge/2, "nudge")
+  end
+
   def handle_event("expand", %{"identifier" => identifier}, socket) do
+    was_expanded = MapSet.member?(socket.assigns.expanded, identifier)
+
     expanded =
-      if MapSet.member?(socket.assigns.expanded, identifier) do
+      if was_expanded do
+        unsubscribe_stream(identifier)
         MapSet.delete(socket.assigns.expanded, identifier)
       else
+        subscribe_stream(identifier)
         MapSet.put(socket.assigns.expanded, identifier)
+      end
+
+    streams =
+      if was_expanded do
+        Map.delete(socket.assigns.streams, identifier)
+      else
+        Map.put_new(socket.assigns.streams, identifier, [])
       end
 
     socket =
       socket
       |> assign(:expanded, expanded)
+      |> assign(:streams, streams)
       |> refresh_one_attempt(identifier)
 
     {:noreply, socket}
+  end
+
+  defp submit_nudge(socket, identifier, text, client_fun, label) do
+    text = String.trim(text)
+
+    cond do
+      text == "" ->
+        {:noreply, assign(socket, :last_error, "#{label} rejected: empty message")}
+
+      true ->
+        case client_fun.(identifier, text) do
+          {:ok, %{"ok" => true}} ->
+            drafts = Map.put(socket.assigns.nudge_drafts, identifier, "")
+            {:noreply, socket |> assign(:nudge_drafts, drafts) |> assign(:last_error, nil)}
+
+          {:ok, %{"ok" => false} = resp} ->
+            {:noreply, assign(socket, :last_error, "#{label} rejected: " <> inspect(resp))}
+
+          {:error, reason} ->
+            {:noreply,
+             assign(socket, :last_error, "#{label} failed: " <> format_error(reason))}
+        end
+    end
+  end
+
+  defp subscribe_stream(identifier) do
+    Phoenix.PubSub.subscribe(@runtime_pubsub, "agent:" <> identifier)
+  rescue
+    _ -> :ok
+  end
+
+  defp unsubscribe_stream(identifier) do
+    Phoenix.PubSub.unsubscribe(@runtime_pubsub, "agent:" <> identifier)
+  rescue
+    _ -> :ok
   end
 
   # ---------------------- Refresh helpers ----------------------
@@ -205,6 +306,7 @@ defmodule Symphony.Dashboard.OverviewLive do
                 <th>claim</th>
                 <th>attempt</th>
                 <th>worker node</th>
+                <th>actions</th>
               </tr>
             </thead>
             <tbody>
@@ -216,11 +318,22 @@ defmodule Symphony.Dashboard.OverviewLive do
                   <td><.claim_badge status={issue["vo_state"]["claim_status"]} /></td>
                   <td>{issue["vo_state"]["last_attempt_n"]}</td>
                   <td><code>{issue["vo_state"]["worker_node"]}</code></td>
+                  <td>
+                    <.row_actions
+                      identifier={issue["identifier"]}
+                      claim_status={issue["vo_state"]["claim_status"]}
+                    />
+                  </td>
                 </tr>
                 <%= if MapSet.member?(@expanded, issue["identifier"]) do %>
                   <tr>
-                    <td colspan="6">
-                      <.attempt_panel issue={issue} cached={Map.get(@attempts, issue["identifier"])} />
+                    <td colspan="7">
+                      <.attempt_panel
+                        issue={issue}
+                        cached={Map.get(@attempts, issue["identifier"])}
+                        stream={Map.get(@streams, issue["identifier"], [])}
+                        nudge_draft={Map.get(@nudge_drafts, issue["identifier"], "")}
+                      />
                     </td>
                   </tr>
                 <% end %>
@@ -269,14 +382,43 @@ defmodule Symphony.Dashboard.OverviewLive do
     """
   end
 
+  defp claim_badge(%{status: "cancelled"} = assigns) do
+    ~H"""
+    <span class="badge cancelled">cancelled</span>
+    """
+  end
+
   defp claim_badge(assigns) do
     ~H"""
     <span class="badge">{@status}</span>
     """
   end
 
+  attr :identifier, :string, required: true
+  attr :claim_status, :any, required: true
+
+  defp row_actions(%{claim_status: "running"} = assigns) do
+    ~H"""
+    <button
+      type="button"
+      class="btn btn-cancel"
+      phx-click="cancel"
+      phx-value-identifier={@identifier}
+      onclick="event.stopPropagation()"
+    >cancel</button>
+    """
+  end
+
+  defp row_actions(assigns) do
+    ~H"""
+    <span class="muted">—</span>
+    """
+  end
+
   attr :issue, :map, required: true
   attr :cached, :any, required: true
+  attr :stream, :list, required: true
+  attr :nudge_draft, :string, required: true
 
   defp attempt_panel(%{cached: %{"attempt_n" => _, "data" => %{}}} = assigns) do
     ~H"""
@@ -300,6 +442,9 @@ defmodule Symphony.Dashboard.OverviewLive do
           <pre>{turn["response"]}</pre>
         </div>
       <% end %>
+
+      <.live_stream stream={@stream} />
+      <.nudge_form identifier={@issue["identifier"]} draft={@nudge_draft} />
     </details>
     """
   end
@@ -308,9 +453,83 @@ defmodule Symphony.Dashboard.OverviewLive do
     ~H"""
     <details class="attempt" open>
       <summary class="muted">loading attempt state for {@issue["identifier"]}…</summary>
+      <.live_stream stream={@stream} />
+      <.nudge_form identifier={@issue["identifier"]} draft={@nudge_draft} />
     </details>
     """
   end
+
+  attr :identifier, :string, required: true
+  attr :draft, :string, required: true
+
+  defp nudge_form(assigns) do
+    ~H"""
+    <form
+      phx-submit="nudge_submit"
+      phx-change="nudge_change"
+      class="nudge-form"
+      onclick="event.stopPropagation()"
+    >
+      <input type="hidden" name="identifier" value={@identifier} />
+      <textarea
+        name="text"
+        rows="2"
+        placeholder="Send a note to the agent. Next-turn nudge waits for the current turn to finish; interrupt-now aborts the in-flight turn (costs its tokens)."
+      ><%= @draft %></textarea>
+      <div class="nudge-buttons">
+        <button type="submit" name="action" value="next" class="btn btn-nudge">
+          send to agent (next turn)
+        </button>
+        <button type="submit" name="action" value="now" class="btn btn-nudge-now">
+          send + interrupt now
+        </button>
+      </div>
+    </form>
+    """
+  end
+
+  attr :stream, :list, required: true
+
+  defp live_stream(assigns) do
+    ~H"""
+    <div class="live-stream">
+      <div class="role">live agent stream <span class="muted">· newest first · capped at 100</span></div>
+      <%= if @stream == [] do %>
+        <p class="muted">No events yet — events will appear here as the agent runs.</p>
+      <% else %>
+        <ul class="stream-events">
+          <%= for event <- @stream do %>
+            <li>
+              <span class="muted">{format_at_ms(event.at)}</span>
+              <code>{event.method || "(no method)"}</code>
+              <%= if snippet = format_event_snippet(event.params) do %>
+                <span class="muted">— {snippet}</span>
+              <% end %>
+            </li>
+          <% end %>
+        </ul>
+      <% end %>
+    </div>
+    """
+  end
+
+  defp format_at_ms(ms) when is_integer(ms) do
+    ms
+    |> DateTime.from_unix!(:millisecond)
+    |> DateTime.truncate(:millisecond)
+    |> DateTime.to_iso8601()
+  end
+
+  defp format_at_ms(_), do: "?"
+
+  defp format_event_snippet(%{"text" => t}) when is_binary(t) and t != "",
+    do: t |> String.slice(0, 120) |> String.replace(~r/\s+/, " ")
+
+  defp format_event_snippet(%{"delta" => %{"text" => t}}) when is_binary(t) and t != "",
+    do: t |> String.slice(0, 120) |> String.replace(~r/\s+/, " ")
+
+  defp format_event_snippet(%{"name" => name}) when is_binary(name), do: "tool: " <> name
+  defp format_event_snippet(_), do: nil
 
   defp short_hash(nil), do: "—"
   defp short_hash(hash) when is_binary(hash), do: String.slice(hash, 0, 12) <> "…"

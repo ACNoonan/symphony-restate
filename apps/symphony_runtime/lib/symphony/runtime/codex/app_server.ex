@@ -62,7 +62,8 @@ defmodule Symphony.Runtime.Codex.AppServer do
           turn_timeout_ms: pos_integer(),
           approval_policy: term(),
           thread_sandbox: String.t(),
-          turn_sandbox_policy: map() | nil
+          turn_sandbox_policy: map() | nil,
+          on_event: (map() -> any()) | nil
         ]
 
   @type result :: %{
@@ -102,18 +103,41 @@ defmodule Symphony.Runtime.Codex.AppServer do
       when is_binary(prompt) and is_map(issue) do
     merged_opts = Keyword.merge(session.opts, opts)
 
-    case start_turn(port, thread_id, prompt, issue, workspace, merged_opts) do
-      {:ok, turn_id} ->
-        case stream_until_terminal(port, merged_opts) do
-          {:ok, %{text: text, events: events}} ->
-            {:ok, %{text: text, events: events, thread_id: thread_id, turn_id: turn_id}}
+    with_on_event(merged_opts, fn ->
+      case start_turn(port, thread_id, prompt, issue, workspace, merged_opts) do
+        {:ok, turn_id} ->
+          case stream_until_terminal(port, merged_opts) do
+            {:ok, %{text: text, events: events}} ->
+              {:ok, %{text: text, events: events, thread_id: thread_id, turn_id: turn_id}}
 
-          {:error, _} = err ->
-            err
+            {:error, _} = err ->
+              err
+          end
+
+        {:error, _} = err ->
+          err
+      end
+    end)
+  end
+
+  # Stash the on_event callback in the process dictionary for the
+  # duration of one turn so handle_line/4 can fire it without
+  # threading it through every recursion of receive_loop. Cleared on
+  # exit so a long-lived Session process never carries a stale hook
+  # across turn boundaries.
+  defp with_on_event(opts, fun) do
+    case Keyword.get(opts, :on_event) do
+      hook when is_function(hook, 1) ->
+        prev = Process.put(:codex_app_server_on_event, hook)
+
+        try do
+          fun.()
+        after
+          if prev, do: Process.put(:codex_app_server_on_event, prev), else: Process.delete(:codex_app_server_on_event)
         end
 
-      {:error, _} = err ->
-        err
+      _ ->
+        fun.()
     end
   end
 
@@ -283,15 +307,20 @@ defmodule Symphony.Runtime.Codex.AppServer do
   defp handle_line(port, line, timeout_ms, events, accumulated_text) do
     case Jason.decode(line) do
       {:ok, %{"method" => "turn/completed"} = payload} ->
+        emit_event(payload)
         {:ok, %{text: accumulated_text, events: Enum.reverse([payload | events])}}
 
       {:ok, %{"method" => "turn/failed"} = payload} ->
+        emit_event(payload)
         {:error, {:turn_failed, Map.get(payload, "params")}}
 
       {:ok, %{"method" => "turn/cancelled"} = payload} ->
+        emit_event(payload)
         {:error, {:turn_cancelled, Map.get(payload, "params")}}
 
       {:ok, %{"method" => method} = payload} when is_binary(method) ->
+        emit_event(payload)
+
         case maybe_handle_approval(port, method, payload) do
           :handled ->
             receive_loop(port, timeout_ms, "", [payload | events], accumulated_text)
@@ -302,11 +331,29 @@ defmodule Symphony.Runtime.Codex.AppServer do
         end
 
       {:ok, payload} ->
+        emit_event(payload)
         receive_loop(port, timeout_ms, "", [payload | events], accumulated_text)
 
       {:error, _} ->
         log_non_json(line)
         receive_loop(port, timeout_ms, "", events, accumulated_text)
+    end
+  end
+
+  defp emit_event(payload) do
+    case Process.get(:codex_app_server_on_event) do
+      fun when is_function(fun, 1) ->
+        try do
+          fun.(payload)
+        rescue
+          e ->
+            Logger.warning(fn ->
+              "codex on_event hook raised: #{Exception.message(e)} — continuing stream"
+            end)
+        end
+
+      _ ->
+        :ok
     end
   end
 

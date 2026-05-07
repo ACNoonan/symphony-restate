@@ -60,6 +60,36 @@ defmodule Symphony.Dashboard.RestateClient do
   end
 
   @doc """
+  Operator-initiated cancel for the active run of one issue. Calls
+  the IssueVO's shared `cancel` handler, which forwards to the
+  active workflow's cancel awakeable.
+  """
+  @spec issue_cancel(String.t()) :: response()
+  def issue_cancel(identifier) when is_binary(identifier) do
+    object_call("IssueVO", identifier, "cancel")
+  end
+
+  @doc """
+  Operator interjection for the active run of one issue. The
+  message is durably stored and prepended to the next turn's
+  prompt.
+  """
+  @spec issue_nudge(String.t(), String.t()) :: response()
+  def issue_nudge(identifier, text) when is_binary(identifier) and is_binary(text) do
+    object_call("IssueVO", identifier, "nudge", %{"text" => text})
+  end
+
+  @doc """
+  Mid-turn operator interjection. Aborts the in-flight turn and
+  durably stages the message for the next turn — sub-second
+  responsiveness at the cost of the in-flight turn's tokens.
+  """
+  @spec issue_nudge_now(String.t(), String.t()) :: response()
+  def issue_nudge_now(identifier, text) when is_binary(identifier) and is_binary(text) do
+    object_call("IssueVO", identifier, "nudgeNow", %{"text" => text})
+  end
+
+  @doc """
   Read one attempt's workflow state. `attempt_n` is the integer
   attempt number from the issue's `last_attempt_n`; the workflow
   key follows the `IssueVO.attempt_workflow_key/2` convention.
