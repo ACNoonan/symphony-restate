@@ -1,0 +1,35 @@
+# Local single-node Restate for the slice 5 demo.
+#
+# The BEAM (symphony-restate handlers + dashboard) intentionally
+# runs on the host, not in Docker. Codex spawns as a Port child of
+# the BEAM, so keeping the BEAM on the host means `pkill -9 codex`
+# in the chaos beats reaches it directly. Restate itself doesn't
+# need to see the codex process — only the BEAM does.
+#
+# Ports (defaults from `restate-server`):
+#   - 8080: ingress (public; the BEAM and the dashboard talk to this)
+#   - 9070: admin   (the BEAM endpoint registers here)
+#   - 9071: node-to-node (unused with a single node, exposed anyway)
+#
+# Pinned to the same Restate version restate-elixir tests against
+# (service-protocol V5 era). Bump in lockstep with restate-elixir
+# `Dockerfile`'s pin.
+services:
+  restate:
+    image: docker.restate.dev/restatedev/restate:1.6.2
+    container_name: symphony-restate
+    ports:
+      - "8080:8080"
+      - "9070:9070"
+      - "9071:9071"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9070/health"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    networks:
+      - restate-net
+
+networks:
+  restate-net:
+    driver: bridge
