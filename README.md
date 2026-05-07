@@ -2,10 +2,11 @@
 
 OpenAI [Symphony](https://github.com/openai/symphony) on Restate — a durable substrate for the spec.
 
-> **Status: pre-alpha, slice 4 done (2026-05-06).** Pivoted 2026-05-05. Built on
+> **Status: pre-alpha, slice 5 done (2026-05-06).** Pivoted 2026-05-05. Built on
 > [`restate-elixir`](https://github.com/ACNoonan/restate-elixir) v0.2.0 (local path-dep
 > until Hex-published). Implements Symphony's `SPEC.md` external contract; internal
-> architecture is Restate-native. See `docs/architecture.md`.
+> architecture is Restate-native. See `docs/architecture.md` and
+> [`docs/demo-script.md`](docs/demo-script.md) for the chaos-beat narrative.
 
 ## What this is
 
@@ -73,9 +74,11 @@ Shipped through slice 3:
 - `ctx.set_state` for the per-turn `conversation` append + per-tick scheduler
   bookkeeping
 
-Planned in later slices:
-
-- Chaos hooks + demo-script E2E (slice 5)
+All five planned slices shipped. The next layer (cancellation across the
+call tree, stall-fired mid-attempt cancellation of the live
+`CodexTurnService` invocation, multi-node Restate cluster for the
+"physical Restate failover" beat) is open work — see
+`docs/architecture.md` for the residual list.
 
 ## Run it locally
 
@@ -126,7 +129,21 @@ durable `conversation` via cold-path seeding.
 
 ## Demo script
 
-`docs/demo-script.md` — TBD; lands with slice 5 (chaos beats).
+[`docs/demo-script.md`](docs/demo-script.md) — three chaos beats
+(`pkill codex` / kill the BEAM / kill the Restate container) each
+zeroed in on a single architectural invariant. Drives via
+`mix symphony.chaos {kill_codex,kill_beam,kill_restate}` and the
+shell scripts in `scripts/`.
+
+```sh
+./scripts/dev/up.sh                   # restate-server in docker
+mix run --no-halt                     # BEAM + dashboard on host
+./scripts/dev/register.sh             # one-time register w/ Restate
+mix symphony.scheduler start <SLUG> --interval 30000 --exec
+
+# then in a separate shell:
+mix symphony.chaos kill_codex
+```
 
 ## Status
 
@@ -139,7 +156,7 @@ durable `conversation` via cold-path seeding.
 | 2.5 | `IssueVO` slimmed to claim/dispatch; turn loop extracted into `RunAttemptWorkflow` (Workflow service, keyed `${id}::a${n}`); WORKFLOW.md content-hash pinned per attempt; node-local workspace preflight outside `ctx.run`; idempotent Linear comments via `(identifier, attempt_n, turn_n)` markers; idle-timeout for `Codex.Session`; `linear_graphql` dynamic tool so the agent can drive its own ticket | **done (2026-05-05)** |
 | 3 | Codex turn extracted as `CodexTurnService` (Restate Service); workflow uses `ctx.call_async` + `ctx.timer` + `Awaitable.any` for the turn-vs-stall race; on stall, kills `Codex.Session` port and raises terminal failure; `IssueVO.read_state` shared handler for snapshots; `Linear.list_issues_in_project!`; `SchedulerVO` poll loop self-rescheduling via `ctx.send_async(invoke_at_ms:)` + `Awaitable.all` reconciliation across N issues; `mix symphony.scheduler {start,stop,tick,reconcile}` driver | **done (2026-05-06)** |
 | 4 | New `:symphony_dashboard` umbrella app: Phoenix 1.7 + LiveView 1.0 on `:4000`, single `OverviewLive` with 2s auto-refresh; `RestateClient` HTTP wrapper hitting Restate ingress for `SchedulerVO.reconcile` + `IssueVO.readState` + `RunAttemptWorkflow.readState`; click-to-expand attempt panels showing conversation, content-hash pin, workspace_path; stale-state badge surfaces ingress failure; no asset pipeline (Phoenix/LV JS served from each dep's priv/static) | **done (2026-05-06)** |
-| 5 | Chaos beats (`pkill` codex / BEAM node / Restate node) | not started |
+| 5 | Root `docker-compose.yml` (single-node Restate); `scripts/dev/{up,down,register}.sh` boot helpers; `scripts/chaos/{kill-codex,kill-beam,kill-restate}.sh` three chaos beats with banners that name the invariant they exercise; `mix symphony.chaos {kill_codex,kill_beam,kill_restate}` wrapper; `docs/demo-script.md` narrative the operator runs from. | **done (2026-05-06)** |
 
 Demo readiness gate: see [`demo-engineering.md` §6](../demo-engineering.md).
 

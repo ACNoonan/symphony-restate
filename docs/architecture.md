@@ -147,7 +147,7 @@ preemption that meets the cancel halfway.
 | 2.5 | `IssueVO` slimmed to claim/dispatch (`claim_status`, `last_attempt_n`, `worker_node`); turn loop extracted into `RunAttemptWorkflow` (Workflow service keyed `${id}::a${n}`); WORKFLOW.md content read inside `ctx.run` so its bytes (and the SHA-256 hash) are pinned per attempt; `Workspace` split into `path_for/2` (journaled, inside `ctx.run`) + `preflight_local!/1` (outside, every replay) so cross-node resumes don't see a missing cwd; `Linear.post_comment_idempotent!/3` w/ deterministic `(identifier, attempt_n, turn_n)` marker; `Codex.Session` idle timeout w/ `Manager.run_turn` retry-on-noproc; `Codex.DynamicTool` registers `linear_graphql` on `thread/start` and dispatches `item/tool/call`. | done |
 | 3 | `CodexTurnService` extracts the codex turn into a Restate Service so the workflow gets an awaitable handle; `RunAttemptWorkflow` races the turn against `ctx.timer(stall_timeout_ms)` via `Awaitable.any`, kills `Codex.Session` on stall, raises terminal `codex_turn_stall`; `IssueVO.read_state` shared handler for non-mutating snapshots; `Linear.list_issues_in_project!` + active-state filter; `SchedulerVO` per-project poll loop self-rescheduling its `tick` via `ctx.send_async(invoke_at_ms:)`, fanning out per-issue dispatches via `send_async`, and `reconcile` reading N issues' VO state in parallel with `call_async` + `Awaitable.all`; `mix symphony.scheduler {start,stop,tick,reconcile}` CLI. | done |
 | 4 | New `:symphony_dashboard` umbrella app: Phoenix 1.7 + LiveView 1.0 on `:4000`; `Symphony.Dashboard.OverviewLive` with 2s auto-refresh via `Process.send_after(:refresh)`; `Symphony.Dashboard.RestateClient` (Req-based HTTP wrapper for ingress) reads `SchedulerVO.reconcile` / `IssueVO.readState` / `RunAttemptWorkflow.readState`; click-to-expand row panels show per-attempt conversation, content-hash pin, workspace_path; `RunAttemptWorkflow.read_state` shared handler added; layout serves Phoenix + LV JS from each dep's `priv/static` (no asset pipeline). | done |
-| 5 | Chaos hooks (kill codex / kill BEAM node / kill Restate node); demo-script E2E. | not started |
+| 5 | Root `docker-compose.yml` running single-node Restate 1.6.2 (BEAM stays on host so the codex Port child is `pkill`-able); `scripts/dev/{up,down,register}.sh` boot helpers; three chaos beats in `scripts/chaos/`: `kill-codex.sh` (port child), `kill-beam.sh` (host BEAM), `kill-restate.sh` (`docker kill` the cluster node); `mix symphony.chaos {kill_codex,kill_beam,kill_restate}` wrapper; `docs/demo-script.md` narrative — each beat zeroed in on a specific architectural invariant from the table above. | done |
 
 ## Resolved architectural items (slice 2)
 
@@ -236,6 +236,24 @@ preemption that meets the cancel halfway.
   `Context.call_async/5`, and gathers the snapshot via
   `Restate.Awaitable.all/2` — wall time is one Restate round-trip,
   not N.
+
+## Resolved in slice 5
+
+- ~~**Demo-able chaos.**~~ `scripts/chaos/` + `mix symphony.chaos`
+  give the operator one-line triggers for the three failure beats.
+  Each script prints a banner naming what it kills and what to
+  watch on the dashboard, so the audience can follow without
+  reading the doc.
+- ~~**Local stack reproducibility.**~~ Root `docker-compose.yml`
+  pins Restate 1.6.2 (matched to `restate-elixir`'s test version);
+  `scripts/dev/up.sh` waits for the admin API health-check before
+  returning, so the operator never tries to register against a
+  not-yet-ready Restate.
+- ~~**Operator narrative.**~~ `docs/demo-script.md` — three beats,
+  each tied to a specific architectural invariant from the
+  `SPEC.md` mapping table. Wrap-up reframes the demo as
+  "Symphony said the orchestrator state isn't restored; we
+  killed three things and it was."
 
 ## Resolved in slice 4
 
